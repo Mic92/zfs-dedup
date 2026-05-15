@@ -68,39 +68,70 @@ pub fn build_index(files: &[(PathBuf, Hashed)]) -> Index {
     idx
 }
 
-struct Handles<'a> {
+struct Ctx<'a> {
     files: &'a [(PathBuf, Hashed)],
     fds: Vec<Option<File>>,
-    write: bool,
+    dry_run: bool,
+    // Reused across candidates to avoid per-call malloc + memset; the
+    // flamegraph showed those costing ~14% of the verify path.
+    buf_a: Vec<u8>,
+    buf_b: Vec<u8>,
 }
 
-impl<'a> Handles<'a> {
-    fn new(files: &'a [(PathBuf, Hashed)], write: bool) -> Self {
+impl<'a> Ctx<'a> {
+    fn new(files: &'a [(PathBuf, Hashed)], dry_run: bool) -> Self {
         Self {
             files,
             fds: (0..files.len()).map(|_| None).collect(),
-            write,
+            dry_run,
+            buf_a: Vec::new(),
+            buf_b: Vec::new(),
         }
     }
 
-    fn get(&mut self, i: usize) -> Result<&File> {
+    fn fd(&mut self, i: usize) -> Result<&File> {
         if self.fds[i].is_none() {
             self.fds[i] = Some(
                 File::options()
                     .read(true)
-                    .write(self.write)
+                    .write(!self.dry_run)
                     .open(&self.files[i].0)
                     .with_context(|| format!("open {:?}", self.files[i].0))?,
             );
         }
         Ok(self.fds[i].as_ref().expect("just set"))
     }
+
+    // No FIDEDUPERANGE on ZFS, so the compare/clone window is racy. We
+    // re-read here rather than trusting the (possibly stale) cache hash.
+    fn verify_and_clone(&mut self, src: Loc, dst: Loc, blksz: u64, len: u64) -> Result<bool> {
+        let src_off = src.chunk as u64 * blksz;
+        let dst_off = dst.chunk as u64 * blksz;
+        self.buf_a.resize(len as usize, 0);
+        self.buf_b.resize(len as usize, 0);
+        let mut a = std::mem::take(&mut self.buf_a);
+        let mut b = std::mem::take(&mut self.buf_b);
+        self.fd(src.file)?.read_exact_at(&mut a, src_off)?;
+        self.fd(dst.file)?.read_exact_at(&mut b, dst_off)?;
+        let equal = a == b;
+        self.buf_a = a;
+        self.buf_b = b;
+        if !equal {
+            return Ok(false);
+        }
+        if !self.dry_run {
+            let sf = self.fd(src.file)?.try_clone()?;
+            let df = self.fd(dst.file)?;
+            clone_range(&sf, src_off, df, dst_off, len).context("FICLONERANGE")?;
+        }
+        Ok(true)
+    }
 }
 
 pub fn dedup(files: &[(PathBuf, Hashed)], dry_run: bool) -> Stats {
     let idx = build_index(files);
     let mut stats = Stats::default();
-    let mut handles = Handles::new(files, !dry_run);
+    let mut ctx = Ctx::new(files, dry_run);
 
     for ((blksz, _), locs) in &idx {
         let blksz = *blksz as u64;
@@ -117,7 +148,7 @@ pub fn dedup(files: &[(PathBuf, Hashed)], dry_run: bool) -> Stats {
             if len != chunk_len(&files[dst.file].1, dst.chunk, blksz) {
                 continue; // tail-vs-full mismatch
             }
-            match verify_and_clone(&mut handles, src, dst, blksz, len, dry_run) {
+            match ctx.verify_and_clone(src, dst, blksz, len) {
                 Ok(true) => {
                     stats.verified += 1;
                     if !dry_run {
@@ -145,34 +176,6 @@ pub fn dedup(files: &[(PathBuf, Hashed)], dry_run: bool) -> Stats {
 fn chunk_len(h: &Hashed, chunk: u32, blksz: u64) -> u64 {
     let off = chunk as u64 * blksz;
     (h.stat.size - off).min(blksz)
-}
-
-fn verify_and_clone(
-    handles: &mut Handles,
-    src: Loc,
-    dst: Loc,
-    blksz: u64,
-    len: u64,
-    dry_run: bool,
-) -> Result<bool> {
-    let src_off = src.chunk as u64 * blksz;
-    let dst_off = dst.chunk as u64 * blksz;
-
-    // No FIDEDUPERANGE on ZFS, so the compare/clone window is racy. We
-    // re-read here rather than trusting the (possibly stale) cache hash.
-    let mut a = vec![0u8; len as usize];
-    let mut b = vec![0u8; len as usize];
-    handles.get(src.file)?.read_exact_at(&mut a, src_off)?;
-    handles.get(dst.file)?.read_exact_at(&mut b, dst_off)?;
-    if a != b {
-        return Ok(false);
-    }
-    if !dry_run {
-        let sf = handles.get(src.file)?.try_clone()?;
-        let df = handles.get(dst.file)?;
-        clone_range(&sf, src_off, df, dst_off, len).context("FICLONERANGE")?;
-    }
-    Ok(true)
 }
 
 #[cfg(test)]
