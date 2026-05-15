@@ -8,11 +8,10 @@ use rayon::prelude::*;
 
 use crate::cache::{Cache, ChunkHash, EntryRef, HASH_LEN};
 
-// Sentinel for all-zero chunks. Cannot collide with a real XXH3-128
-// output except at 2^-128, and the false positive would only produce a
-// wasted byte-compare anyway. We skip these in the index: ZFS handles
-// zero runs via compression (zle/lz4), and a sparse-file workload would
-// otherwise put millions of locations in one bucket.
+// Sentinel for all-zero chunks. Collision with a real XXH3-128 output is
+// 2^-128 and only costs a wasted memcmp. Skipped in the index: ZFS already
+// collapses zero runs via compression, and sparse files would otherwise put
+// millions of locations in one bucket.
 pub const ZERO_HASH: ChunkHash = [0u8; HASH_LEN];
 
 #[derive(Debug, Clone, Copy)]
@@ -70,13 +69,10 @@ pub fn hash_chunk(buf: &[u8]) -> ChunkHash {
     xxhash_rust::xxh3::xxh3_128(buf).to_le_bytes()
 }
 
-// Slice equality compiles to memcmp, which is SIMD and faster than a
-// hand-rolled u64 loop. For non-zero blocks the first cache line
-// disagrees and memcmp bails immediately. For all-zero blocks the full
-// scan still beats running xxhash.
+// Slice eq compiles to memcmp: SIMD, bails on first differing cache line
+// for non-zero blocks, and beats xxhash for full all-zero scans.
 fn is_zero(buf: &[u8]) -> bool {
-    // Default ZFS recordsize; lives in .bss so it's free. Larger blocks
-    // (recordsize up to 16M with feature@large_blocks) loop.
+    // Default ZFS recordsize, .bss so it's free; larger blocks loop.
     static ZEROS: [u8; 1 << 17] = [0u8; 1 << 17];
     let mut rest = buf;
     while !rest.is_empty() {
@@ -175,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_chunks_get_sentinel() {
+    fn zero_sentinel() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("z");
         let mut data = vec![0u8; 4096];
@@ -201,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_hit_then_invalidate() {
+    fn invalidation() {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(&dir.path().join("c.redb")).unwrap();
         let p = dir.path().join("f");

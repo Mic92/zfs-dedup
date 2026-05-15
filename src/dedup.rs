@@ -21,15 +21,14 @@ pub struct Stats {
     pub errors: usize,
 }
 
-impl Stats {
-    fn add(mut self, o: Stats) -> Stats {
+impl std::ops::AddAssign for Stats {
+    fn add_assign(&mut self, o: Stats) {
         self.candidates += o.candidates;
         self.verified += o.verified;
         self.cloned += o.cloned;
         self.bytes += o.bytes;
         self.mismatches += o.mismatches;
         self.errors += o.errors;
-        self
     }
 }
 
@@ -197,7 +196,10 @@ pub fn dedup(files: &[(PathBuf, Hashed)], dry_run: bool) -> Stats {
             },
         )
         .map(|w| w.stats)
-        .reduce(Stats::default, Stats::add)
+        .reduce(Stats::default, |mut a, b| {
+            a += b;
+            a
+        })
 }
 
 fn chunk_len(h: &Hashed, chunk: u32, blksz: u64) -> u64 {
@@ -230,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_finds_duplicates() {
+    fn finds_dupes() {
         let dir = tempfile::tempdir().unwrap();
         let blk = vec![9u8; 4096];
         let mut a = blk.clone();
@@ -249,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn nothing_to_do() {
+    fn no_dupes() {
         let dir = tempfile::tempdir().unwrap();
         let files = [
             fixture(dir.path(), "a", &[1u8; 4096], 4096),
@@ -259,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn zeros_never_group() {
+    fn ignores_zeros() {
         let dir = tempfile::tempdir().unwrap();
         let z = [0u8; 8192];
         let files = [
@@ -270,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_blksz_never_groups() {
+    fn cross_blksz() {
         let dir = tempfile::tempdir().unwrap();
         let data = [9u8; 4096];
         let files = [

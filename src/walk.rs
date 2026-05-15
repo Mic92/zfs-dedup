@@ -48,7 +48,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn collapses_hardlinks_skips_dirs_and_symlinks() {
+    fn filtering() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
         std::fs::write(p.join("a"), b"x").unwrap();
