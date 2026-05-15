@@ -12,6 +12,7 @@ rayon = "1"
 redb = "3"
 jwalk = "0.8"
 anyhow = "1"
+lexopt = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
