@@ -10,12 +10,14 @@ usage: zfs-dedup [-n] [-c CACHE] [-j N] DIR...
   -c, --cache PATH   hash cache (default: zfs-dedup.redb)
   -n, --dry-run      don't modify anything
   -j, --jobs N       hashing threads (default: all cores)
+  -f, --force        scan non-ZFS filesystems too
 ";
 
 struct Args {
     cache: PathBuf,
     dry_run: bool,
     jobs: Option<usize>,
+    force: bool,
     dirs: Vec<PathBuf>,
 }
 
@@ -25,6 +27,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
         cache: "zfs-dedup.redb".into(),
         dry_run: false,
         jobs: None,
+        force: false,
         dirs: vec![],
     };
     let mut p = lexopt::Parser::from_env();
@@ -33,6 +36,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             Short('c') | Long("cache") => args.cache = p.value()?.into(),
             Short('n') | Long("dry-run") => args.dry_run = true,
             Short('j') | Long("jobs") => args.jobs = Some(p.value()?.parse()?),
+            Short('f') | Long("force") => args.force = true,
             Short('h') | Long("help") => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -73,7 +77,7 @@ fn run(args: &Args) -> Result<()> {
     // Don't dedup our own cache file if it lives under a scanned dir; redb
     // preallocates zero pages that all hash equal and shift under us.
     let cache_abs = std::fs::canonicalize(&args.cache).ok();
-    let mut paths = walk::files(&args.dirs);
+    let mut paths = walk::files(&args.dirs, !args.force);
     paths.retain(|p| std::fs::canonicalize(p).ok() != cache_abs);
     eprintln!("found {} files", paths.len());
 

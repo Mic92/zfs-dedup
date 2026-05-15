@@ -3,48 +3,35 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-parts.url = "github:hercules-ci/flake-parts";
     treefmt-nix.url = "github:numtide/treefmt-nix";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
-    inputs@{ flake-parts, ... }:
-    flake-parts.lib.mkFlake { inherit inputs; } {
+    {
+      nixpkgs,
+      treefmt-nix,
+      ...
+    }:
+    let
       systems = [
         "x86_64-linux"
         "aarch64-linux"
       ];
-      imports = [ inputs.treefmt-nix.flakeModule ];
+      eachSystem = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+    in
+    {
+      packages = eachSystem (pkgs: rec {
+        zfs-dedup = pkgs.callPackage ./nix/package.nix { };
+        default = zfs-dedup;
+      });
 
-      perSystem =
-        { pkgs, self', ... }:
-        {
-          packages.default = pkgs.rustPlatform.buildRustPackage {
-            pname = "zfs-dedup";
-            version = "0.1.0";
-            src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
-          };
-
-          devShells.default = pkgs.mkShell {
-            inputsFrom = [ self'.packages.default ];
-            packages = with pkgs; [
-              rustc
-              cargo
-              clippy
-              rustfmt
-              rust-analyzer
-              cargo-watch
-            ];
-            RUST_BACKTRACE = "1";
-          };
-
-          treefmt = {
-            projectRootFile = "flake.nix";
-            programs.nixfmt.enable = true;
-            programs.rustfmt.enable = true;
-          };
+      devShells = eachSystem (pkgs: {
+        default = pkgs.callPackage ./nix/shell.nix {
+          zfs-dedup = pkgs.callPackage ./nix/package.nix { };
         };
+      });
+
+      formatter = eachSystem (pkgs: import ./nix/fmt.nix { inherit pkgs treefmt-nix; });
     };
 }

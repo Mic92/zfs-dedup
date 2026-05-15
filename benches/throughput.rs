@@ -59,7 +59,7 @@ fn pipeline(b: Bencher, (n_files, mb_each, dup_pct): (usize, u64, u8)) {
 
 fn run_pipeline(data_dir: &Path, cache_path: &Path) -> zfs_dedup::dedup::Stats {
     let cache = Cache::open(cache_path).unwrap();
-    let paths = walk::files(std::slice::from_ref(&data_dir.to_path_buf()));
+    let paths = walk::files(std::slice::from_ref(&data_dir.to_path_buf()), false);
     let hashed: Vec<_> = hash_files(&cache, &paths)
         .unwrap()
         .into_iter()
