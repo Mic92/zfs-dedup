@@ -135,7 +135,12 @@ fn run(args: &Args) -> Result<bool> {
             }
         }
     }
-    eprintln!("hashed {} files ({hits} from cache)", hashed.len());
+    let total: u64 = hashed.iter().map(|(_, h)| h.stat.size).sum();
+    eprintln!(
+        "hashed {} files ({hits} from cache), {} total",
+        hashed.len(),
+        human(total)
+    );
 
     let pruned = cache.prune(&seen)?;
     if pruned > 0 {
@@ -143,16 +148,16 @@ fn run(args: &Args) -> Result<bool> {
     }
 
     let stats = dedup::dedup(&hashed, args.dry_run);
-    let action = if args.dry_run {
-        "would clone"
+    let pct = if total > 0 {
+        stats.bytes as f64 / total as f64 * 100.0
     } else {
-        "cloned"
+        0.0
     };
+    let verb = if args.dry_run { "would save" } else { "saved" };
     eprintln!(
-        "{} candidates, {} verified, {action} {}, {} mismatches, {} errors",
-        stats.candidates,
-        stats.verified,
+        "{verb} {} ({pct:.1}%) across {} blocks, {} mismatches, {} errors",
         human(stats.bytes),
+        stats.verified,
         stats.mismatches,
         stats.errors,
     );
