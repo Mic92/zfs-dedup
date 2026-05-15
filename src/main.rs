@@ -7,11 +7,19 @@ use zfs_dedup::{cache::Cache, dedup, hasher, walk};
 
 const USAGE: &str = "\
 usage: zfs-dedup [-n] [-c CACHE] [-j N] DIR...
-  -c, --cache PATH   hash cache (default: zfs-dedup.redb)
+  -c, --cache PATH   hash cache (default: $XDG_CACHE_HOME/zfs-dedup/cache.redb)
   -n, --dry-run      don't modify anything
   -j, --jobs N       hashing threads (default: all cores)
   -f, --force        scan non-ZFS filesystems too
 ";
+
+fn default_cache() -> PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from("/var/cache"));
+    base.join("zfs-dedup").join("cache.redb")
+}
 
 struct Args {
     cache: PathBuf,
@@ -24,7 +32,7 @@ struct Args {
 fn parse_args() -> Result<Args, lexopt::Error> {
     use lexopt::prelude::*;
     let mut args = Args {
-        cache: "zfs-dedup.redb".into(),
+        cache: default_cache(),
         dry_run: false,
         jobs: None,
         force: false,
@@ -73,6 +81,9 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args) -> Result<()> {
+    if let Some(parent) = args.cache.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let cache = Cache::open(&args.cache)?;
     // Don't dedup our own cache file if it lives under a scanned dir; redb
     // preallocates zero pages that all hash equal and shift under us.

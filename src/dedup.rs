@@ -83,13 +83,14 @@ pub fn build_index(files: &[(PathBuf, Hashed)]) -> Index {
     idx
 }
 
-// Per-rayon-task state. Each task owns its own fds and read buffers; no
-// locking. Two tasks may open the same file (independent fds) and clone
-// into different offsets concurrently, which ZFS handles fine. Groups
-// never share a (file, chunk) since each chunk has exactly one hash.
+// Per-rayon-task state. Read buffers reused across candidates; no fd
+// cache because n_workers * n_files would blow ulimit -n on big trees,
+// and open() is dwarfed by the verify reads anyway. Two tasks may open
+// the same file (independent fds) and clone into different offsets
+// concurrently, which ZFS handles fine. Groups never share a
+// (file, chunk) since each chunk has exactly one hash.
 struct Worker<'a> {
     files: &'a [(PathBuf, Hashed)],
-    fds: Vec<Option<File>>,
     dry_run: bool,
     buf_a: Vec<u8>,
     buf_b: Vec<u8>,
@@ -100,7 +101,6 @@ impl<'a> Worker<'a> {
     fn new(files: &'a [(PathBuf, Hashed)], dry_run: bool) -> Self {
         Self {
             files,
-            fds: (0..files.len()).map(|_| None).collect(),
             dry_run,
             buf_a: Vec::new(),
             buf_b: Vec::new(),
@@ -108,17 +108,12 @@ impl<'a> Worker<'a> {
         }
     }
 
-    fn fd(&mut self, i: usize) -> Result<&File> {
-        if self.fds[i].is_none() {
-            self.fds[i] = Some(
-                File::options()
-                    .read(true)
-                    .write(!self.dry_run)
-                    .open(&self.files[i].0)
-                    .with_context(|| format!("open {:?}", self.files[i].0))?,
-            );
-        }
-        Ok(self.fds[i].as_ref().expect("just set"))
+    fn open(&self, i: usize) -> Result<File> {
+        File::options()
+            .read(true)
+            .write(!self.dry_run)
+            .open(&self.files[i].0)
+            .with_context(|| format!("open {:?}", self.files[i].0))
     }
 
     fn group(&mut self, blksz: u64, locs: &[Loc]) {
@@ -162,22 +157,17 @@ impl<'a> Worker<'a> {
     fn verify_and_clone(&mut self, src: Loc, dst: Loc, blksz: u64, len: u64) -> Result<bool> {
         let src_off = src.chunk as u64 * blksz;
         let dst_off = dst.chunk as u64 * blksz;
+        let sf = self.open(src.file)?;
+        let df = self.open(dst.file)?;
         self.buf_a.resize(len as usize, 0);
         self.buf_b.resize(len as usize, 0);
-        let mut a = std::mem::take(&mut self.buf_a);
-        let mut b = std::mem::take(&mut self.buf_b);
-        self.fd(src.file)?.read_exact_at(&mut a, src_off)?;
-        self.fd(dst.file)?.read_exact_at(&mut b, dst_off)?;
-        let equal = a == b;
-        self.buf_a = a;
-        self.buf_b = b;
-        if !equal {
+        sf.read_exact_at(&mut self.buf_a, src_off)?;
+        df.read_exact_at(&mut self.buf_b, dst_off)?;
+        if self.buf_a != self.buf_b {
             return Ok(false);
         }
         if !self.dry_run {
-            let sf = self.fd(src.file)?.try_clone()?;
-            let df = self.fd(dst.file)?;
-            clone_range(&sf, src_off, df, dst_off, len).context("FICLONERANGE")?;
+            clone_range(&sf, src_off, &df, dst_off, len).context("FICLONERANGE")?;
         }
         Ok(true)
     }
