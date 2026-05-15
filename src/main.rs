@@ -11,6 +11,7 @@ usage: zfs-dedup [-n] [-c CACHE] [-j N] DIR...
   -n, --dry-run      don't modify anything
   -j, --jobs N       hashing threads (default: all cores)
   -f, --force        scan non-ZFS filesystems too
+  -V, --version      print version
 ";
 
 fn default_cache() -> PathBuf {
@@ -49,6 +50,10 @@ fn parse_args() -> Result<Args, lexopt::Error> {
                 print!("{USAGE}");
                 std::process::exit(0);
             }
+            Short('V') | Long("version") => {
+                println!("zfs-dedup {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             Value(v) => args.dirs.push(v.into()),
             _ => return Err(arg.unexpected()),
         }
@@ -73,14 +78,32 @@ fn main() -> ExitCode {
             .build_global()
             .ok();
     }
-    if let Err(e) = run(&args) {
-        eprintln!("zfs-dedup: {e:#}");
-        return ExitCode::FAILURE;
+    match run(&args) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE, // ran, but some files couldn't be processed
+        Err(e) => {
+            eprintln!("zfs-dedup: {e:#}");
+            ExitCode::FAILURE
+        }
     }
-    ExitCode::SUCCESS
 }
 
-fn run(args: &Args) -> Result<()> {
+fn human(b: u64) -> String {
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{b} B")
+    } else {
+        format!("{v:.1} {}", U[i])
+    }
+}
+
+fn run(args: &Args) -> Result<bool> {
     if let Some(parent) = args.cache.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -96,6 +119,7 @@ fn run(args: &Args) -> Result<()> {
     let mut hashed = Vec::with_capacity(results.len());
     let mut seen = HashSet::new();
     let mut hits = 0usize;
+    let mut hash_errors = 0usize;
     for (p, r) in results {
         match r {
             Ok(h) => {
@@ -105,7 +129,10 @@ fn run(args: &Args) -> Result<()> {
                 }
                 hashed.push((p, h));
             }
-            Err(e) => eprintln!("skip {}: {e:#}", p.display()),
+            Err(e) => {
+                eprintln!("skip {}: {e:#}", p.display());
+                hash_errors += 1;
+            }
         }
     }
     eprintln!("hashed {} files ({hits} from cache)", hashed.len());
@@ -122,8 +149,12 @@ fn run(args: &Args) -> Result<()> {
         "cloned"
     };
     eprintln!(
-        "{} candidates, {} verified, {action} {} ({} bytes), {} mismatches, {} errors",
-        stats.candidates, stats.verified, stats.cloned, stats.bytes, stats.mismatches, stats.errors
+        "{} candidates, {} verified, {action} {}, {} mismatches, {} errors",
+        stats.candidates,
+        stats.verified,
+        human(stats.bytes),
+        stats.mismatches,
+        stats.errors,
     );
-    Ok(())
+    Ok(hash_errors == 0 && stats.errors == 0)
 }
