@@ -20,14 +20,14 @@ pub struct Stats {
 }
 
 #[derive(Clone, Copy)]
-struct Loc {
+pub struct Loc {
     file: usize,
     chunk: u32,
 }
 
 // One candidate group per (blksz, hash). zfs_clone_range refuses
 // cross-blocksize clones, so files with different blksz never share.
-fn build_index(files: &[(PathBuf, Hashed)]) -> HashMap<(u32, ChunkHash), Vec<Loc>> {
+pub fn build_index(files: &[(PathBuf, Hashed)]) -> HashMap<(u32, ChunkHash), Vec<Loc>> {
     let mut idx: HashMap<(u32, ChunkHash), Vec<Loc>> = HashMap::new();
     for (fi, (_, h)) in files.iter().enumerate() {
         for (ci, hash) in h.hashes.iter().enumerate() {
