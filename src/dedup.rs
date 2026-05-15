@@ -5,6 +5,7 @@ use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 
 use crate::cache::ChunkHash;
 use crate::clone::clone_range;
@@ -18,6 +19,18 @@ pub struct Stats {
     pub bytes: u64,
     pub mismatches: usize,
     pub errors: usize,
+}
+
+impl Stats {
+    fn add(mut self, o: Stats) -> Stats {
+        self.candidates += o.candidates;
+        self.verified += o.verified;
+        self.cloned += o.cloned;
+        self.bytes += o.bytes;
+        self.mismatches += o.mismatches;
+        self.errors += o.errors;
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -68,17 +81,20 @@ pub fn build_index(files: &[(PathBuf, Hashed)]) -> Index {
     idx
 }
 
-struct Ctx<'a> {
+// Per-rayon-task state. Each task owns its own fds and read buffers; no
+// locking. Two tasks may open the same file (independent fds) and clone
+// into different offsets concurrently, which ZFS handles fine. Groups
+// never share a (file, chunk) since each chunk has exactly one hash.
+struct Worker<'a> {
     files: &'a [(PathBuf, Hashed)],
     fds: Vec<Option<File>>,
     dry_run: bool,
-    // Reused across candidates to avoid per-call malloc + memset; the
-    // flamegraph showed those costing ~14% of the verify path.
     buf_a: Vec<u8>,
     buf_b: Vec<u8>,
+    stats: Stats,
 }
 
-impl<'a> Ctx<'a> {
+impl<'a> Worker<'a> {
     fn new(files: &'a [(PathBuf, Hashed)], dry_run: bool) -> Self {
         Self {
             files,
@@ -86,6 +102,7 @@ impl<'a> Ctx<'a> {
             dry_run,
             buf_a: Vec::new(),
             buf_b: Vec::new(),
+            stats: Stats::default(),
         }
     }
 
@@ -100,6 +117,42 @@ impl<'a> Ctx<'a> {
             );
         }
         Ok(self.fds[i].as_ref().expect("just set"))
+    }
+
+    fn group(&mut self, blksz: u64, locs: &[Loc]) {
+        // First location is the canonical source; everything else gets
+        // cloned from it.
+        let src = locs[0];
+        for &dst in &locs[1..] {
+            if src.file == dst.file && src.chunk == dst.chunk {
+                continue;
+            }
+            self.stats.candidates += 1;
+            let len = chunk_len(&self.files[src.file].1, src.chunk, blksz);
+            if len != chunk_len(&self.files[dst.file].1, dst.chunk, blksz) {
+                continue; // tail-vs-full mismatch
+            }
+            match self.verify_and_clone(src, dst, blksz, len) {
+                Ok(true) => {
+                    self.stats.verified += 1;
+                    if !self.dry_run {
+                        self.stats.cloned += 1;
+                    }
+                    self.stats.bytes += len;
+                }
+                Ok(false) => self.stats.mismatches += 1,
+                Err(e) => {
+                    eprintln!(
+                        "skip {:?}+{} <- {:?}+{}: {e:#}",
+                        self.files[dst.file].0,
+                        dst.chunk as u64 * blksz,
+                        self.files[src.file].0,
+                        src.chunk as u64 * blksz,
+                    );
+                    self.stats.errors += 1;
+                }
+            }
+        }
     }
 
     // No FIDEDUPERANGE on ZFS, so the compare/clone window is racy. We
@@ -130,47 +183,18 @@ impl<'a> Ctx<'a> {
 
 pub fn dedup(files: &[(PathBuf, Hashed)], dry_run: bool) -> Stats {
     let idx = build_index(files);
-    let mut stats = Stats::default();
-    let mut ctx = Ctx::new(files, dry_run);
-
-    for ((blksz, _), locs) in &idx {
-        let blksz = *blksz as u64;
-        // First location in the group is the canonical source; everything
-        // else gets cloned from it.
-        let src = locs[0];
-        for &dst in &locs[1..] {
-            // Same file, same offset: already shared.
-            if src.file == dst.file && src.chunk == dst.chunk {
-                continue;
-            }
-            stats.candidates += 1;
-            let len = chunk_len(&files[src.file].1, src.chunk, blksz);
-            if len != chunk_len(&files[dst.file].1, dst.chunk, blksz) {
-                continue; // tail-vs-full mismatch
-            }
-            match ctx.verify_and_clone(src, dst, blksz, len) {
-                Ok(true) => {
-                    stats.verified += 1;
-                    if !dry_run {
-                        stats.cloned += 1;
-                    }
-                    stats.bytes += len;
-                }
-                Ok(false) => stats.mismatches += 1,
-                Err(e) => {
-                    eprintln!(
-                        "skip {:?}+{} <- {:?}+{}: {e:#}",
-                        files[dst.file].0,
-                        dst.chunk as u64 * blksz,
-                        files[src.file].0,
-                        src.chunk as u64 * blksz,
-                    );
-                    stats.errors += 1;
-                }
-            }
-        }
-    }
-    stats
+    let groups: Vec<_> = idx.into_iter().collect();
+    groups
+        .into_par_iter()
+        .fold(
+            || Worker::new(files, dry_run),
+            |mut w, ((blksz, _), locs)| {
+                w.group(blksz as u64, &locs);
+                w
+            },
+        )
+        .map(|w| w.stats)
+        .reduce(Stats::default, Stats::add)
 }
 
 fn chunk_len(h: &Hashed, chunk: u32, blksz: u64) -> u64 {
