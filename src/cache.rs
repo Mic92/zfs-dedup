@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
-pub const HASH_LEN: usize = 32;
+pub const HASH_LEN: usize = 16;
 pub type ChunkHash = [u8; HASH_LEN];
 
 const FILES: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("files");
@@ -160,7 +160,7 @@ mod tests {
             mtime_ns: 1,
             ctime_ns: 2,
             blksz: 131072,
-            hashes: (0..n).map(|i| [i as u8; 32]).collect(),
+            hashes: (0..n).map(|i| [i as u8; HASH_LEN]).collect(),
         }
     }
 

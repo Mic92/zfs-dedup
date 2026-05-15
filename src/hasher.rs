@@ -32,8 +32,10 @@ impl Stat {
 }
 
 // Chunk boundaries follow st_blksize so the hashes line up with ranges
-// FICLONERANGE will accept. blake3 is plenty fast single-threaded per
-// chunk; we get parallelism across files via rayon at the call site.
+// FICLONERANGE will accept. XXH3-128 is non-crypto; we always byte-verify
+// candidate pairs before cloning, so the hash only has to keep the false-
+// positive rate low. Cross-file parallelism comes from rayon at the call
+// site.
 pub fn hash_file(path: &Path, blksz: u32) -> Result<Vec<ChunkHash>> {
     ensure!(blksz > 0, "blksz must be > 0");
     let mut f = File::open(path).with_context(|| format!("open {path:?}"))?;
@@ -44,12 +46,16 @@ pub fn hash_file(path: &Path, blksz: u32) -> Result<Vec<ChunkHash>> {
         if n == 0 {
             break;
         }
-        hashes.push(*blake3::hash(&buf[..n]).as_bytes());
+        hashes.push(hash_chunk(&buf[..n]));
         if n < buf.len() {
             break;
         }
     }
     Ok(hashes)
+}
+
+pub fn hash_chunk(buf: &[u8]) -> ChunkHash {
+    xxhash_rust::xxh3::xxh3_128(buf).to_le_bytes()
 }
 
 fn read_full(f: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -132,9 +138,9 @@ mod tests {
         std::fs::write(&p, b"aaaabbbbcc").unwrap();
         let hs = hash_file(&p, 4).unwrap();
         assert_eq!(hs.len(), 3);
-        assert_eq!(hs[0], *blake3::hash(b"aaaa").as_bytes());
-        assert_eq!(hs[1], *blake3::hash(b"bbbb").as_bytes());
-        assert_eq!(hs[2], *blake3::hash(b"cc").as_bytes());
+        assert_eq!(hs[0], hash_chunk(b"aaaa"));
+        assert_eq!(hs[1], hash_chunk(b"bbbb"));
+        assert_eq!(hs[2], hash_chunk(b"cc"));
     }
 
     #[test]

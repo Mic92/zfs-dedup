@@ -7,7 +7,7 @@ description = "Offline block-level deduplication for ZFS via FICLONERANGE"
 
 [dependencies]
 rustix = { version = "1", features = ["fs"] }
-blake3 = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 rayon = "1"
 redb = "3"
 jwalk = "0.8"
