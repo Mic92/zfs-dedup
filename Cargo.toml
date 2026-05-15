@@ -6,3 +6,4 @@ license = "MIT"
 description = "Offline block-level deduplication for ZFS via FICLONERANGE"
 
 [dependencies]
+rustix = { version = "1", features = ["fs"] }
