@@ -9,7 +9,7 @@ use rayon::prelude::*;
 
 use crate::cache::ChunkHash;
 use crate::clone::clone_range;
-use crate::hasher::Hashed;
+use crate::hasher::{Hashed, ZERO_HASH};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
@@ -71,6 +71,9 @@ pub fn build_index(files: &[(PathBuf, Hashed)]) -> Index {
     let mut idx = Index::default();
     for (fi, (_, h)) in files.iter().enumerate() {
         for (ci, hash) in h.hashes.iter().enumerate() {
+            if *hash == ZERO_HASH {
+                continue;
+            }
             idx.entry((h.stat.blksz, *hash)).or_default().push(Loc {
                 file: fi,
                 chunk: ci as u32,
@@ -251,6 +254,17 @@ mod tests {
         let files = [
             fixture(dir.path(), "a", &[1u8; 4096], 4096),
             fixture(dir.path(), "b", &[2u8; 4096], 4096),
+        ];
+        assert_eq!(dedup(&files, true).candidates, 0);
+    }
+
+    #[test]
+    fn zeros_never_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let z = [0u8; 8192];
+        let files = [
+            fixture(dir.path(), "a", &z, 4096),
+            fixture(dir.path(), "b", &z, 4096),
         ];
         assert_eq!(dedup(&files, true).candidates, 0);
     }

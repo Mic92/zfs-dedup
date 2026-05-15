@@ -6,7 +6,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use rayon::prelude::*;
 
-use crate::cache::{Cache, ChunkHash, EntryRef};
+use crate::cache::{Cache, ChunkHash, EntryRef, HASH_LEN};
+
+// Sentinel for all-zero chunks. Cannot collide with a real XXH3-128
+// output except at 2^-128, and the false positive would only produce a
+// wasted byte-compare anyway. We skip these in the index: ZFS handles
+// zero runs via compression (zle/lz4), and a sparse-file workload would
+// otherwise put millions of locations in one bucket.
+pub const ZERO_HASH: ChunkHash = [0u8; HASH_LEN];
 
 #[derive(Debug, Clone, Copy)]
 pub struct Stat {
@@ -46,7 +53,12 @@ pub fn hash_file(path: &Path, blksz: u32) -> Result<Vec<ChunkHash>> {
         if n == 0 {
             break;
         }
-        hashes.push(hash_chunk(&buf[..n]));
+        let chunk = &buf[..n];
+        hashes.push(if is_zero(chunk) {
+            ZERO_HASH
+        } else {
+            hash_chunk(chunk)
+        });
         if n < buf.len() {
             break;
         }
@@ -56,6 +68,25 @@ pub fn hash_file(path: &Path, blksz: u32) -> Result<Vec<ChunkHash>> {
 
 pub fn hash_chunk(buf: &[u8]) -> ChunkHash {
     xxhash_rust::xxh3::xxh3_128(buf).to_le_bytes()
+}
+
+// Slice equality compiles to memcmp, which is SIMD and faster than a
+// hand-rolled u64 loop. For non-zero blocks the first cache line
+// disagrees and memcmp bails immediately. For all-zero blocks the full
+// scan still beats running xxhash.
+fn is_zero(buf: &[u8]) -> bool {
+    // Default ZFS recordsize; lives in .bss so it's free. Larger blocks
+    // (recordsize up to 16M with feature@large_blocks) loop.
+    static ZEROS: [u8; 1 << 17] = [0u8; 1 << 17];
+    let mut rest = buf;
+    while !rest.is_empty() {
+        let n = rest.len().min(ZEROS.len());
+        if rest[..n] != ZEROS[..n] {
+            return false;
+        }
+        rest = &rest[n..];
+    }
+    true
 }
 
 fn read_full(f: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -141,6 +172,24 @@ mod tests {
         assert_eq!(hs[0], hash_chunk(b"aaaa"));
         assert_eq!(hs[1], hash_chunk(b"bbbb"));
         assert_eq!(hs[2], hash_chunk(b"cc"));
+    }
+
+    #[test]
+    fn zero_chunks_get_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("z");
+        let mut data = vec![0u8; 4096];
+        data.extend_from_slice(&[1u8; 4096]);
+        data.extend_from_slice(&[0u8; 4096]);
+        std::fs::write(&p, &data).unwrap();
+        let hs = hash_file(&p, 4096).unwrap();
+        assert_eq!(hs[0], ZERO_HASH);
+        assert_ne!(hs[1], ZERO_HASH);
+        assert_eq!(hs[2], ZERO_HASH);
+        // Sentinel is reachable for truly-zero input only.
+        assert!(is_zero(&[0; 4096]));
+        assert!(!is_zero(&[0, 0, 0, 1]));
+        assert!(!is_zero(&[1, 0, 0, 0]));
     }
 
     #[test]
