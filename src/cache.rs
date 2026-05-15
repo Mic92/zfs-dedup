@@ -54,15 +54,17 @@ impl FileEntry {
         if buf.len() < HEADER || !(buf.len() - HEADER).is_multiple_of(HASH_LEN) {
             bail!("corrupt cache entry, len {}", buf.len());
         }
+        // Slices are exact-length after the bounds check above; try_into
+        // can't fail but the compiler doesn't know.
+        fn arr<const N: usize>(b: &[u8]) -> [u8; N] {
+            b.try_into().expect("len checked")
+        }
         Ok(Self {
-            size: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            mtime_ns: i128::from_le_bytes(buf[8..24].try_into().unwrap()),
-            ctime_ns: i128::from_le_bytes(buf[24..40].try_into().unwrap()),
-            blksz: u32::from_le_bytes(buf[40..44].try_into().unwrap()),
-            hashes: buf[HEADER..]
-                .chunks_exact(HASH_LEN)
-                .map(|c| c.try_into().unwrap())
-                .collect(),
+            size: u64::from_le_bytes(arr(&buf[0..8])),
+            mtime_ns: i128::from_le_bytes(arr(&buf[8..24])),
+            ctime_ns: i128::from_le_bytes(arr(&buf[24..40])),
+            blksz: u32::from_le_bytes(arr(&buf[40..44])),
+            hashes: buf[HEADER..].chunks_exact(HASH_LEN).map(arr).collect(),
         })
     }
 
