@@ -4,18 +4,12 @@ use std::process::ExitCode;
 use anyhow::Result;
 
 const USAGE: &str = "\
-Usage: zfs-dedup [OPTIONS] <DIR>...
-
-Offline block-level deduplication for ZFS via FICLONERANGE.
-
-Options:
-  -c, --cache <PATH>   Hash cache file (default: ./zfs-dedup.redb)
-  -n, --dry-run        Report what would be deduped, do not modify files
-  -j, --jobs <N>       Parallel hashing threads (default: all cores)
-  -h, --help           Show this help
+usage: zfs-dedup [-n] [-c CACHE] [-j N] DIR...
+  -c, --cache PATH   hash cache (default: zfs-dedup.redb)
+  -n, --dry-run      don't modify anything
+  -j, --jobs N       hashing threads (default: all cores)
 ";
 
-#[derive(Debug)]
 struct Args {
     cache: PathBuf,
     dry_run: bool,
@@ -25,41 +19,37 @@ struct Args {
 
 fn parse_args() -> Result<Args, lexopt::Error> {
     use lexopt::prelude::*;
-    let mut cache = PathBuf::from("zfs-dedup.redb");
-    let mut dry_run = false;
-    let mut jobs = None;
-    let mut dirs = Vec::new();
-
-    let mut parser = lexopt::Parser::from_env();
-    while let Some(arg) = parser.next()? {
+    let mut args = Args {
+        cache: "zfs-dedup.redb".into(),
+        dry_run: false,
+        jobs: None,
+        dirs: vec![],
+    };
+    let mut p = lexopt::Parser::from_env();
+    while let Some(arg) = p.next()? {
         match arg {
-            Short('c') | Long("cache") => cache = PathBuf::from(parser.value()?),
-            Short('n') | Long("dry-run") => dry_run = true,
-            Short('j') | Long("jobs") => jobs = Some(parser.value()?.parse()?),
+            Short('c') | Long("cache") => args.cache = p.value()?.into(),
+            Short('n') | Long("dry-run") => args.dry_run = true,
+            Short('j') | Long("jobs") => args.jobs = Some(p.value()?.parse()?),
             Short('h') | Long("help") => {
                 print!("{USAGE}");
                 std::process::exit(0);
             }
-            Value(v) => dirs.push(PathBuf::from(v)),
+            Value(v) => args.dirs.push(v.into()),
             _ => return Err(arg.unexpected()),
         }
     }
-    if dirs.is_empty() {
-        return Err("missing required argument: <DIR>".into());
+    if args.dirs.is_empty() {
+        return Err("no directories given".into());
     }
-    Ok(Args {
-        cache,
-        dry_run,
-        jobs,
-        dirs,
-    })
+    Ok(args)
 }
 
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("error: {e}\n\n{USAGE}");
+            eprint!("zfs-dedup: {e}\n{USAGE}");
             return ExitCode::from(2);
         }
     };
@@ -70,7 +60,7 @@ fn main() -> ExitCode {
             .ok();
     }
     if let Err(e) = run(&args) {
-        eprintln!("error: {e:#}");
+        eprintln!("zfs-dedup: {e:#}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
@@ -78,7 +68,7 @@ fn main() -> ExitCode {
 
 fn run(args: &Args) -> Result<()> {
     eprintln!(
-        "zfs-dedup: cache={:?} dry_run={} dirs={:?}",
+        "cache={:?} dry_run={} dirs={:?}",
         args.cache, args.dry_run, args.dirs
     );
     // TODO: walk -> hash -> index -> dedup

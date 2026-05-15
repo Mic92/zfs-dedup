@@ -1,24 +1,16 @@
-//! Persistent per-file chunk-hash cache backed by redb.
-//!
-//! Keyed on `(dev, ino)`. A cached entry is valid only when size, mtime,
-//! ctime, and blksz all match the current stat — otherwise the file was
-//! modified (or the inode reused) and we must rehash.
-//!
-//! Hashes are stored in offset order: chunk `i` covers bytes
-//! `[i * blksz, (i+1) * blksz)` (last chunk may be short).
-
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use redb::{Database, ReadableDatabase, TableDefinition};
 
 pub const HASH_LEN: usize = 32;
 pub type ChunkHash = [u8; HASH_LEN];
 
-/// `(dev, ino) -> serialized FileEntry`
 const FILES: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("files");
 
-/// Stat fingerprint plus the ordered chunk hashes for one file.
+// Keyed on (dev, ino). Entry is stale if any of size/mtime/ctime/blksz
+// changed since we hashed. Hashes are in offset order, chunk i covers
+// [i*blksz, (i+1)*blksz).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
     pub size: u64,
@@ -28,11 +20,11 @@ pub struct FileEntry {
     pub hashes: Vec<ChunkHash>,
 }
 
-const HEADER_LEN: usize = 8 + 16 + 16 + 4;
+const HEADER: usize = 8 + 16 + 16 + 4;
 
 impl FileEntry {
     fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(HEADER_LEN + self.hashes.len() * HASH_LEN);
+        let mut buf = Vec::with_capacity(HEADER + self.hashes.len() * HASH_LEN);
         buf.extend_from_slice(&self.size.to_le_bytes());
         buf.extend_from_slice(&self.mtime_ns.to_le_bytes());
         buf.extend_from_slice(&self.ctime_ns.to_le_bytes());
@@ -44,27 +36,21 @@ impl FileEntry {
     }
 
     fn decode(buf: &[u8]) -> Result<Self> {
-        if buf.len() < HEADER_LEN || !(buf.len() - HEADER_LEN).is_multiple_of(HASH_LEN) {
-            bail!("corrupt cache entry: length {}", buf.len());
+        if buf.len() < HEADER || !(buf.len() - HEADER).is_multiple_of(HASH_LEN) {
+            bail!("corrupt cache entry, len {}", buf.len());
         }
-        let size = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        let mtime_ns = i128::from_le_bytes(buf[8..24].try_into().unwrap());
-        let ctime_ns = i128::from_le_bytes(buf[24..40].try_into().unwrap());
-        let blksz = u32::from_le_bytes(buf[40..44].try_into().unwrap());
-        let hashes = buf[HEADER_LEN..]
-            .chunks_exact(HASH_LEN)
-            .map(|c| c.try_into().unwrap())
-            .collect();
         Ok(Self {
-            size,
-            mtime_ns,
-            ctime_ns,
-            blksz,
-            hashes,
+            size: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            mtime_ns: i128::from_le_bytes(buf[8..24].try_into().unwrap()),
+            ctime_ns: i128::from_le_bytes(buf[24..40].try_into().unwrap()),
+            blksz: u32::from_le_bytes(buf[40..44].try_into().unwrap()),
+            hashes: buf[HEADER..]
+                .chunks_exact(HASH_LEN)
+                .map(|c| c.try_into().unwrap())
+                .collect(),
         })
     }
 
-    /// Validity check against a freshly stat'd file.
     pub fn matches(&self, size: u64, mtime_ns: i128, ctime_ns: i128, blksz: u32) -> bool {
         self.size == size
             && self.mtime_ns == mtime_ns
@@ -79,8 +65,7 @@ pub struct Cache {
 
 impl Cache {
     pub fn open(path: &Path) -> Result<Self> {
-        let db = Database::create(path).with_context(|| format!("open cache {path:?}"))?;
-        // Ensure table exists so first read doesn't error.
+        let db = Database::create(path)?;
         let tx = db.begin_write()?;
         tx.open_table(FILES)?;
         tx.commit()?;
@@ -97,16 +82,9 @@ impl Cache {
     }
 
     pub fn put(&self, dev: u64, ino: u64, entry: &FileEntry) -> Result<()> {
-        let tx = self.db.begin_write()?;
-        {
-            let mut table = tx.open_table(FILES)?;
-            table.insert((dev, ino), entry.encode().as_slice())?;
-        }
-        tx.commit()?;
-        Ok(())
+        self.put_many([(dev, ino, entry)])
     }
 
-    /// Batch insert in a single transaction — much faster than per-file `put`.
     pub fn put_many<'a>(
         &self,
         entries: impl IntoIterator<Item = (u64, u64, &'a FileEntry)>,
@@ -130,8 +108,8 @@ mod tests {
     fn entry(n: usize) -> FileEntry {
         FileEntry {
             size: 131072 * n as u64,
-            mtime_ns: 1_700_000_000_000_000_000,
-            ctime_ns: 1_700_000_000_000_000_001,
+            mtime_ns: 1,
+            ctime_ns: 2,
             blksz: 131072,
             hashes: (0..n).map(|i| [i as u8; 32]).collect(),
         }
@@ -148,19 +126,19 @@ mod tests {
     }
 
     #[test]
-    fn encode_decode_empty() {
+    fn encode_empty() {
         let e = entry(0);
         assert_eq!(FileEntry::decode(&e.encode()).unwrap(), e);
     }
 
     #[test]
-    fn decode_rejects_garbage() {
-        assert!(FileEntry::decode(&[0u8; 5]).is_err());
-        assert!(FileEntry::decode(&[0u8; HEADER_LEN + 1]).is_err());
+    fn decode_garbage() {
+        assert!(FileEntry::decode(&[0; 5]).is_err());
+        assert!(FileEntry::decode(&[0; HEADER + 1]).is_err());
     }
 
     #[test]
-    fn matches_fingerprint() {
+    fn matches() {
         let e = entry(2);
         assert!(e.matches(e.size, e.mtime_ns, e.ctime_ns, e.blksz));
         assert!(!e.matches(e.size + 1, e.mtime_ns, e.ctime_ns, e.blksz));
@@ -169,12 +147,12 @@ mod tests {
     }
 
     #[test]
-    fn put_many_batch() {
+    fn batch() {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(&dir.path().join("c.redb")).unwrap();
         let es: Vec<_> = (0..10).map(entry).collect();
         cache
-            .put_many(es.iter().enumerate().map(|(i, e)| (0u64, i as u64, e)))
+            .put_many(es.iter().enumerate().map(|(i, e)| (0, i as u64, e)))
             .unwrap();
         for (i, e) in es.iter().enumerate() {
             assert_eq!(cache.get(0, i as u64).unwrap().as_ref(), Some(e));
