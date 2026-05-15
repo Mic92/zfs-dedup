@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
@@ -25,10 +26,36 @@ pub struct Loc {
     chunk: u32,
 }
 
+// XXH3-128 keys are already uniform; SipHash on top is wasted CPU. Take
+// the last 8 bytes of the chunk hash and fold in blksz.
+#[derive(Default)]
+pub struct ChunkKeyHasher(u64);
+
+impl Hasher for ChunkKeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        // Called once for the [u8; 16] field. Use its tail.
+        if bytes.len() >= 8 {
+            self.0 ^= u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().expect("len >= 8"));
+        } else {
+            for &b in bytes {
+                self.0 = self.0.rotate_left(8) ^ b as u64;
+            }
+        }
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.0 ^= u64::from(n).wrapping_mul(0x9e3779b97f4a7c15);
+    }
+}
+
+pub type Index = HashMap<(u32, ChunkHash), Vec<Loc>, BuildHasherDefault<ChunkKeyHasher>>;
+
 // One candidate group per (blksz, hash). zfs_clone_range refuses
 // cross-blocksize clones, so files with different blksz never share.
-pub fn build_index(files: &[(PathBuf, Hashed)]) -> HashMap<(u32, ChunkHash), Vec<Loc>> {
-    let mut idx: HashMap<(u32, ChunkHash), Vec<Loc>> = HashMap::new();
+pub fn build_index(files: &[(PathBuf, Hashed)]) -> Index {
+    let mut idx = Index::default();
     for (fi, (_, h)) in files.iter().enumerate() {
         for (ci, hash) in h.hashes.iter().enumerate() {
             idx.entry((h.stat.blksz, *hash)).or_default().push(Loc {

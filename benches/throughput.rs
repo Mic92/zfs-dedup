@@ -36,7 +36,11 @@ fn index(b: Bencher, n_chunks: u32) {
         ctime_ns: 0,
         blksz: 131072,
     };
-    let hashes = (0..n_chunks).map(|i| (i as u128).to_le_bytes()).collect();
+    // Realistic 128-bit keys: production hashes are uniform across all
+    // bytes, and ChunkKeyHasher relies on that.
+    let hashes = (0..n_chunks)
+        .map(|i| hash_chunk(&i.to_le_bytes()))
+        .collect();
     let files = vec![(
         PathBuf::from("x"),
         Hashed {
