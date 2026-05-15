@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use rayon::prelude::*;
 
-use crate::cache::{Cache, ChunkHash, FileEntry};
+use crate::cache::{Cache, ChunkHash, EntryRef};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Stat {
@@ -70,36 +70,32 @@ pub struct Hashed {
     pub from_cache: bool,
 }
 
-pub fn hash_files(cache: &Cache, paths: &[PathBuf]) -> Vec<(PathBuf, Result<Hashed>)> {
+pub fn hash_files(cache: &Cache, paths: &[PathBuf]) -> Result<Vec<(PathBuf, Result<Hashed>)>> {
     let results: Vec<_> = paths
         .par_iter()
         .map(|p| (p.clone(), hash_one(cache, p)))
         .collect();
 
-    let fresh: Vec<_> = results
-        .iter()
-        .filter_map(|(_, r)| r.as_ref().ok())
-        .filter(|h| !h.from_cache)
-        .map(|h| {
-            (
-                h.stat.dev,
-                h.stat.ino,
-                FileEntry {
-                    size: h.stat.size,
-                    mtime_ns: h.stat.mtime_ns,
-                    ctime_ns: h.stat.ctime_ns,
-                    blksz: h.stat.blksz,
-                    hashes: h.hashes.clone(),
-                },
-            )
-        })
-        .collect();
-    if !fresh.is_empty()
-        && let Err(e) = cache.put_many(fresh.iter().map(|(d, i, e)| (*d, *i, e)))
-    {
-        eprintln!("warning: cache write failed: {e:#}");
-    }
-    results
+    cache.put_many(
+        results
+            .iter()
+            .filter_map(|(_, r)| r.as_ref().ok())
+            .filter(|h| !h.from_cache)
+            .map(|h| {
+                (
+                    h.stat.dev,
+                    h.stat.ino,
+                    EntryRef {
+                        size: h.stat.size,
+                        mtime_ns: h.stat.mtime_ns,
+                        ctime_ns: h.stat.ctime_ns,
+                        blksz: h.stat.blksz,
+                        hashes: &h.hashes,
+                    },
+                )
+            }),
+    )?;
+    Ok(results)
 }
 
 fn hash_one(cache: &Cache, path: &Path) -> Result<Hashed> {
@@ -157,10 +153,10 @@ mod tests {
         std::fs::write(&p, vec![7; 8192]).unwrap();
         let ps = std::slice::from_ref(&p);
 
-        let a = hash_files(&cache, ps).pop().unwrap().1.unwrap();
+        let a = hash_files(&cache, ps).unwrap().pop().unwrap().1.unwrap();
         assert!(!a.from_cache);
 
-        let b = hash_files(&cache, ps).pop().unwrap().1.unwrap();
+        let b = hash_files(&cache, ps).unwrap().pop().unwrap().1.unwrap();
         assert!(b.from_cache);
         assert_eq!(a.hashes, b.hashes);
 
@@ -172,7 +168,7 @@ mod tests {
             .write_all(&[1; 4096])
             .unwrap();
 
-        let c = hash_files(&cache, ps).pop().unwrap().1.unwrap();
+        let c = hash_files(&cache, ps).unwrap().pop().unwrap().1.unwrap();
         assert!(!c.from_cache);
         assert_ne!(b.hashes, c.hashes);
     }

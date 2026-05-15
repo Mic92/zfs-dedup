@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 pub const HASH_LEN: usize = 32;
 pub type ChunkHash = [u8; HASH_LEN];
@@ -9,8 +10,12 @@ pub type ChunkHash = [u8; HASH_LEN];
 const FILES: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("files");
 
 // Keyed on (dev, ino). Entry is stale if any of size/mtime/ctime/blksz
-// changed since we hashed. Hashes are in offset order, chunk i covers
-// [i*blksz, (i+1)*blksz).
+// changed. Hashes are in offset order, chunk i covers [i*blksz, (i+1)*blksz).
+//
+// Note: ZFS reports st_blksize == the file's actual on-disk blocksize, which
+// for files smaller than recordsize is the file size rounded up. Files only
+// reach the dataset recordsize once they grow past one record. zfs_clone_range
+// rejects cross-blocksize clones, so the dedup stage must group by blksz.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
     pub size: u64,
@@ -20,21 +25,31 @@ pub struct FileEntry {
     pub hashes: Vec<ChunkHash>,
 }
 
+// Borrowed view for encoding without cloning the hash vector.
+#[derive(Clone, Copy)]
+pub struct EntryRef<'a> {
+    pub size: u64,
+    pub mtime_ns: i128,
+    pub ctime_ns: i128,
+    pub blksz: u32,
+    pub hashes: &'a [ChunkHash],
+}
+
 const HEADER: usize = 8 + 16 + 16 + 4;
 
-impl FileEntry {
-    fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(HEADER + self.hashes.len() * HASH_LEN);
-        buf.extend_from_slice(&self.size.to_le_bytes());
-        buf.extend_from_slice(&self.mtime_ns.to_le_bytes());
-        buf.extend_from_slice(&self.ctime_ns.to_le_bytes());
-        buf.extend_from_slice(&self.blksz.to_le_bytes());
-        for h in &self.hashes {
-            buf.extend_from_slice(h);
-        }
-        buf
+fn encode(e: EntryRef) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(HEADER + e.hashes.len() * HASH_LEN);
+    buf.extend_from_slice(&e.size.to_le_bytes());
+    buf.extend_from_slice(&e.mtime_ns.to_le_bytes());
+    buf.extend_from_slice(&e.ctime_ns.to_le_bytes());
+    buf.extend_from_slice(&e.blksz.to_le_bytes());
+    for h in e.hashes {
+        buf.extend_from_slice(h);
     }
+    buf
+}
 
+impl FileEntry {
     fn decode(buf: &[u8]) -> Result<Self> {
         if buf.len() < HEADER || !(buf.len() - HEADER).is_multiple_of(HASH_LEN) {
             bail!("corrupt cache entry, len {}", buf.len());
@@ -49,6 +64,16 @@ impl FileEntry {
                 .map(|c| c.try_into().unwrap())
                 .collect(),
         })
+    }
+
+    pub fn as_ref(&self) -> EntryRef<'_> {
+        EntryRef {
+            size: self.size,
+            mtime_ns: self.mtime_ns,
+            ctime_ns: self.ctime_ns,
+            blksz: self.blksz,
+            hashes: &self.hashes,
+        }
     }
 
     pub fn matches(&self, size: u64, mtime_ns: i128, ctime_ns: i128, blksz: u32) -> bool {
@@ -81,23 +106,45 @@ impl Cache {
         }
     }
 
-    pub fn put(&self, dev: u64, ino: u64, entry: &FileEntry) -> Result<()> {
+    pub fn put(&self, dev: u64, ino: u64, entry: EntryRef) -> Result<()> {
         self.put_many([(dev, ino, entry)])
     }
 
     pub fn put_many<'a>(
         &self,
-        entries: impl IntoIterator<Item = (u64, u64, &'a FileEntry)>,
+        entries: impl IntoIterator<Item = (u64, u64, EntryRef<'a>)>,
     ) -> Result<()> {
         let tx = self.db.begin_write()?;
         {
             let mut table = tx.open_table(FILES)?;
             for (dev, ino, e) in entries {
-                table.insert((dev, ino), e.encode().as_slice())?;
+                table.insert((dev, ino), encode(e).as_slice())?;
             }
         }
         tx.commit()?;
         Ok(())
+    }
+
+    // Drop entries whose keys weren't seen this run. Keeps the DB from
+    // growing forever as files get deleted or renamed across runs.
+    pub fn prune(&self, seen: &HashSet<(u64, u64)>) -> Result<usize> {
+        let tx = self.db.begin_write()?;
+        let removed;
+        {
+            let mut table = tx.open_table(FILES)?;
+            let stale: Vec<_> = table
+                .iter()?
+                .filter_map(|r| r.ok())
+                .map(|(k, _)| k.value())
+                .filter(|k| !seen.contains(k))
+                .collect();
+            removed = stale.len();
+            for k in stale {
+                table.remove(k)?;
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
     }
 }
 
@@ -120,7 +167,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(&dir.path().join("c.redb")).unwrap();
         let e = entry(3);
-        cache.put(1, 42, &e).unwrap();
+        cache.put(1, 42, e.as_ref()).unwrap();
         assert_eq!(cache.get(1, 42).unwrap().unwrap(), e);
         assert!(cache.get(1, 43).unwrap().is_none());
     }
@@ -128,7 +175,7 @@ mod tests {
     #[test]
     fn encode_empty() {
         let e = entry(0);
-        assert_eq!(FileEntry::decode(&e.encode()).unwrap(), e);
+        assert_eq!(FileEntry::decode(&encode(e.as_ref())).unwrap(), e);
     }
 
     #[test]
@@ -152,10 +199,31 @@ mod tests {
         let cache = Cache::open(&dir.path().join("c.redb")).unwrap();
         let es: Vec<_> = (0..10).map(entry).collect();
         cache
-            .put_many(es.iter().enumerate().map(|(i, e)| (0, i as u64, e)))
+            .put_many(
+                es.iter()
+                    .enumerate()
+                    .map(|(i, e)| (0, i as u64, e.as_ref())),
+            )
             .unwrap();
         for (i, e) in es.iter().enumerate() {
             assert_eq!(cache.get(0, i as u64).unwrap().as_ref(), Some(e));
         }
+    }
+
+    #[test]
+    fn prune_unseen() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(&dir.path().join("c.redb")).unwrap();
+        let e = entry(1);
+        for i in 0..5 {
+            cache.put(0, i, e.as_ref()).unwrap();
+        }
+        let seen: HashSet<_> = [(0, 1), (0, 3)].into();
+        assert_eq!(cache.prune(&seen).unwrap(), 3);
+        assert!(cache.get(0, 0).unwrap().is_none());
+        assert!(cache.get(0, 1).unwrap().is_some());
+        assert!(cache.get(0, 2).unwrap().is_none());
+        assert!(cache.get(0, 3).unwrap().is_some());
+        assert!(cache.get(0, 4).unwrap().is_none());
     }
 }
