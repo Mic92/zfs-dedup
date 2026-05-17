@@ -132,8 +132,9 @@ impl<'a> Worker<'a> {
             }
             self.stats.candidates += 1;
             let len = chunk_len(&self.files[src.file].1, src.chunk, blksz);
-            if len != chunk_len(&self.files[dst.file].1, dst.chunk, blksz) {
-                continue; // tail-vs-full mismatch
+            // len == 0: chunk lies past stat.size (file grew after stat).
+            if len == 0 || len != chunk_len(&self.files[dst.file].1, dst.chunk, blksz) {
+                continue;
             }
             match self.verify_and_clone(src, dst, blksz, len) {
                 Ok(true) => {
@@ -221,9 +222,11 @@ pub fn is_not_found(e: &anyhow::Error) -> bool {
     })
 }
 
+// 0 if `chunk` is past stat.size: file grew between stat() and the
+// hash read, leaving stale entries in the index. Callers skip those.
 fn chunk_len(h: &Hashed, chunk: u32, blksz: u64) -> u64 {
     let off = chunk as u64 * blksz;
-    (h.stat.size - off).min(blksz)
+    h.stat.size.saturating_sub(off).min(blksz)
 }
 
 #[cfg(test)]
@@ -302,6 +305,22 @@ mod tests {
             fixture(dir.path(), "b", &z, 4096),
         ];
         assert_eq!(dedup(&files, DRY).candidates, 0);
+    }
+
+    #[test]
+    fn stale_index_past_eof() {
+        // File grew between stat() and the hash read: index has chunk
+        // offsets past stat.size. Must skip them, not underflow.
+        let dir = tempfile::tempdir().unwrap();
+        let data = [9u8; 8192];
+        let mut files = [
+            fixture(dir.path(), "a", &data, 4096),
+            fixture(dir.path(), "b", &data, 4096),
+        ];
+        for (_, h) in &mut files {
+            h.stat.size = 0;
+        }
+        assert_eq!(dedup(&files, DRY).verified, 0);
     }
 
     #[test]
