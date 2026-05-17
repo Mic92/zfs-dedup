@@ -83,7 +83,7 @@ pub fn files<'a>(
     roots: impl IntoIterator<Item = &'a PathBuf>,
     exclude: &HashSet<(u64, u64)>,
 ) -> Vec<(PathBuf, u64)> {
-    let mut seen = exclude.clone();
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
     for root in roots {
         let stat = || anyhow::Ok((std::fs::metadata(root)?.dev(), fsid(root)?));
@@ -94,7 +94,7 @@ pub fn files<'a>(
                 continue;
             }
         };
-        walk_root(root, dev, fsid, &mut seen, &mut out);
+        walk_root(root, dev, fsid, exclude, &mut seen, &mut out);
     }
     out
 }
@@ -103,6 +103,7 @@ fn walk_root(
     root: &Path,
     root_dev: u64,
     fsid: u64,
+    exclude: &HashSet<(u64, u64)>,
     seen: &mut HashSet<(u64, u64)>,
     out: &mut Vec<(PathBuf, u64)>,
 ) {
@@ -155,9 +156,16 @@ fn walk_root(
         };
         // Stay on the root filesystem; a different dev means we crossed
         // a mount point, which could be non-ZFS or a different pool.
-        if meta.dev() == root_dev && seen.insert((meta.dev(), meta.ino())) {
-            out.push((entry.path(), fsid));
+        if meta.dev() != root_dev || exclude.contains(&(meta.dev(), meta.ino())) {
+            continue;
         }
+        // `seen` exists to dedup hardlinks. Files with nlink == 1 have
+        // no aliases, so don't pay HashSet memory for them; that's most
+        // of any tree.
+        if meta.nlink() > 1 && !seen.insert((meta.dev(), meta.ino())) {
+            continue;
+        }
+        out.push((entry.path(), fsid));
     }
 }
 
@@ -178,9 +186,9 @@ mod tests {
 
         let dev = std::fs::metadata(p).unwrap().dev();
         let names = |excl: &HashSet<(u64, u64)>| {
-            let mut seen = excl.clone();
+            let mut seen = HashSet::new();
             let mut out = Vec::new();
-            super::walk_root(p, dev, 0, &mut seen, &mut out);
+            super::walk_root(p, dev, 0, excl, &mut seen, &mut out);
             out.into_iter()
                 .map(|(f, _)| f.file_name().unwrap().to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
