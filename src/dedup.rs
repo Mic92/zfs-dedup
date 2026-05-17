@@ -138,14 +138,14 @@ impl<'a> Worker<'a> {
                 continue;
             }
             match self.verify_and_clone(src, dst, blksz, len) {
-                Ok(true) => {
+                Ok(Some(bytes)) => {
                     self.stats.verified += 1;
                     if !self.opts.dry_run {
                         self.stats.cloned += 1;
                     }
-                    self.stats.bytes += len;
+                    self.stats.bytes += bytes;
                 }
-                Ok(false) => self.stats.mismatches += 1,
+                Ok(None) => self.stats.mismatches += 1,
                 // File vanished or shrank since we hashed it.
                 Err(e) if is_not_found(&e) => {}
                 Err(e) => {
@@ -162,7 +162,14 @@ impl<'a> Worker<'a> {
         }
     }
 
-    fn verify_and_clone(&mut self, src: Loc, dst: Loc, blksz: u64, len: u64) -> Result<bool> {
+    // Some(bytes deduped) on match, None on mismatch.
+    fn verify_and_clone(
+        &mut self,
+        src: Loc,
+        dst: Loc,
+        blksz: u64,
+        len: u64,
+    ) -> Result<Option<u64>> {
         let src_off = src.chunk * blksz;
         let dst_off = dst.chunk * blksz;
         // Source is read-only: dedup must work on files we can't modify.
@@ -171,8 +178,8 @@ impl<'a> Worker<'a> {
 
         if !self.opts.dry_run && self.opts.fideduperange {
             return match dedupe_range(&sf, src_off, &df, dst_off, len).context("FIDEDUPERANGE")? {
-                Dedupe::Same => Ok(true),
-                Dedupe::Differs => Ok(false),
+                Dedupe::Same(b) => Ok(Some(b)),
+                Dedupe::Differs => Ok(None),
                 Dedupe::Unsupported => anyhow::bail!("FIDEDUPERANGE unsupported"),
             };
         }
@@ -184,12 +191,12 @@ impl<'a> Worker<'a> {
         sf.read_exact_at(&mut self.buf_a, src_off)?;
         df.read_exact_at(&mut self.buf_b, dst_off)?;
         if self.buf_a != self.buf_b {
-            return Ok(false);
+            return Ok(None);
         }
         if !self.opts.dry_run {
             clone_range(&sf, src_off, &df, dst_off, len).context("FICLONERANGE")?;
         }
-        Ok(true)
+        Ok(Some(len))
     }
 }
 
