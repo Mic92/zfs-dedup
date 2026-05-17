@@ -3,7 +3,9 @@ use std::fs::File;
 use std::io::Read;
 use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use crate::walk::FilePath;
 use std::ptr::NonNull;
 
 use anyhow::{Context, Result, ensure};
@@ -184,8 +186,8 @@ pub struct Hashed {
 // instead of accumulating until the end.
 pub fn hash_files(
     cache: &Cache,
-    paths: Vec<(PathBuf, u64)>,
-) -> Result<Vec<(PathBuf, Result<Hashed>)>> {
+    paths: Vec<(FilePath, u64)>,
+) -> Result<Vec<(FilePath, Result<Hashed>)>> {
     const BATCH: usize = 100_000;
     let mut out = Vec::with_capacity(paths.len());
     let mut iter = paths.into_iter();
@@ -197,7 +199,7 @@ pub fn hash_files(
         let results: Vec<_> = batch
             .into_par_iter()
             .map(|(p, fsid)| {
-                let r = hash_one(cache, &p, fsid);
+                let r = hash_one(cache, &p.to_path(), fsid);
                 (p, r)
             })
             .collect();
@@ -310,7 +312,7 @@ mod tests {
         let cache = Cache::open(&dir.path().join("c.redb")).unwrap();
         let p = dir.path().join("f");
         std::fs::write(&p, vec![7; 8192]).unwrap();
-        let ps = || vec![(p.clone(), 0u64)];
+        let ps = || vec![(FilePath::from_path(&p), 0u64)];
 
         let cached = |s: &Stat| cache.get(s.fsid, s.ino).unwrap().unwrap().hashes;
 
