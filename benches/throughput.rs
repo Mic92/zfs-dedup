@@ -74,11 +74,13 @@ fn run_pipeline(data_dir: &Path, cache_path: &Path) -> zfs_dedup::dedup::Stats {
         .collect();
     dedup(
         &hashed,
+        &cache,
         zfs_dedup::dedup::Opts {
             dry_run: true,
             fideduperange: false,
         },
     )
+    .unwrap()
 }
 
 fn pattern(seed: u64) -> [u8; 131072] {
@@ -106,16 +108,20 @@ fn index(b: Bencher, n_chunks: u32) {
     };
     // Realistic 128-bit keys: production hashes are uniform across all
     // bytes, and ChunkKeyHasher relies on that.
-    let hashes = (0..n_chunks)
+    let hashes: Vec<_> = (0..n_chunks)
         .map(|i| hash_chunk(&i.to_le_bytes()))
         .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let cache = Cache::open(&dir.path().join("c.redb")).unwrap();
+    cache
+        .put_many([(stat.fsid, stat.ino, stat.entry(&hashes))])
+        .unwrap();
     let files = vec![(
         PathBuf::from("x"),
         Hashed {
             stat,
-            hashes,
             from_cache: false,
         },
     )];
-    b.bench(|| build_index(black_box(&files)));
+    b.bench(|| build_index(black_box(&files), &cache).unwrap());
 }

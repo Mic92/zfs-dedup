@@ -39,6 +39,16 @@ impl Stat {
             blksz: u32::try_from(m.blksize()).unwrap_or(u32::MAX),
         }
     }
+
+    pub fn entry<'a>(&self, hashes: &'a [ChunkHash]) -> EntryRef<'a> {
+        EntryRef {
+            size: self.size,
+            mtime_ns: self.mtime_ns,
+            ctime_ns: self.ctime_ns,
+            blksz: self.blksz,
+            hashes,
+        }
+    }
 }
 
 // The walk only emits regular files, but a path can be swapped for a
@@ -162,51 +172,47 @@ fn read_full(f: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(off)
 }
 
+// No hashes here: they live in the cache only. Holding them per-file
+// dominated RSS on big trees, and the index is the only consumer.
 pub struct Hashed {
     pub stat: Stat,
-    // Boxed slice: no capacity field, no over-allocation. 8 bytes/file
-    // less than Vec, plus whatever push() over-grew.
-    pub hashes: Box<[ChunkHash]>,
     pub from_cache: bool,
 }
 
+// Hash and persist `paths`; the returned vec carries no hashes.
+// Process in batches so the per-file hash vectors are short-lived
+// instead of accumulating until the end.
 pub fn hash_files(
     cache: &Cache,
     paths: Vec<(PathBuf, u64)>,
 ) -> Result<Vec<(PathBuf, Result<Hashed>)>> {
-    // Take ownership so the path lives once: in the result, not also
-    // in a caller-held source vec.
-    let results: Vec<_> = paths
-        .into_par_iter()
-        .map(|(p, fsid)| {
-            let r = hash_one(cache, &p, fsid);
-            (p, r)
-        })
-        .collect();
-
-    cache.put_many(
-        results
-            .iter()
-            .filter_map(|(_, r)| r.as_ref().ok())
-            .filter(|h| !h.from_cache)
-            .map(|h| {
-                (
-                    h.stat.fsid,
-                    h.stat.ino,
-                    EntryRef {
-                        size: h.stat.size,
-                        mtime_ns: h.stat.mtime_ns,
-                        ctime_ns: h.stat.ctime_ns,
-                        blksz: h.stat.blksz,
-                        hashes: &h.hashes,
-                    },
-                )
-            }),
-    )?;
-    Ok(results)
+    const BATCH: usize = 100_000;
+    let mut out = Vec::with_capacity(paths.len());
+    let mut iter = paths.into_iter();
+    loop {
+        let batch: Vec<_> = iter.by_ref().take(BATCH).collect();
+        if batch.is_empty() {
+            break;
+        }
+        let results: Vec<_> = batch
+            .into_par_iter()
+            .map(|(p, fsid)| {
+                let r = hash_one(cache, &p, fsid);
+                (p, r)
+            })
+            .collect();
+        cache.put_many(results.iter().filter_map(|(_, r)| match r {
+            Ok((h, hashes)) if !h.from_cache => {
+                Some((h.stat.fsid, h.stat.ino, h.stat.entry(hashes)))
+            }
+            _ => None,
+        }))?;
+        out.extend(results.into_iter().map(|(p, r)| (p, r.map(|(h, _)| h))));
+    }
+    Ok(out)
 }
 
-fn hash_one(cache: &Cache, path: &Path, fsid: u64) -> Result<Hashed> {
+fn hash_one(cache: &Cache, path: &Path, fsid: u64) -> Result<(Hashed, Box<[ChunkHash]>)> {
     let f = open_nofollow(path).with_context(|| format!("open {path:?}"))?;
     let meta = f.metadata()?;
     ensure!(meta.is_file(), "not a regular file: {path:?}");
@@ -215,19 +221,23 @@ fn hash_one(cache: &Cache, path: &Path, fsid: u64) -> Result<Hashed> {
     if let Some(entry) = cache.get(stat.fsid, stat.ino)?
         && entry.matches(stat.size, stat.mtime_ns, stat.ctime_ns, stat.blksz)
     {
-        return Ok(Hashed {
-            stat,
-            hashes: entry.hashes,
-            from_cache: true,
-        });
+        return Ok((
+            Hashed {
+                stat,
+                from_cache: true,
+            },
+            entry.hashes,
+        ));
     }
 
     try_o_direct(&f, stat.blksz);
-    Ok(Hashed {
-        stat,
-        hashes: hash_fd(&f, stat.blksz)?.into_boxed_slice(),
-        from_cache: false,
-    })
+    Ok((
+        Hashed {
+            stat,
+            from_cache: false,
+        },
+        hash_fd(&f, stat.blksz)?.into_boxed_slice(),
+    ))
 }
 
 #[cfg(test)]
@@ -302,12 +312,15 @@ mod tests {
         std::fs::write(&p, vec![7; 8192]).unwrap();
         let ps = || vec![(p.clone(), 0u64)];
 
+        let cached = |s: &Stat| cache.get(s.fsid, s.ino).unwrap().unwrap().hashes;
+
         let a = hash_files(&cache, ps()).unwrap().pop().unwrap().1.unwrap();
         assert!(!a.from_cache);
+        let ha = cached(&a.stat);
 
         let b = hash_files(&cache, ps()).unwrap().pop().unwrap().1.unwrap();
         assert!(b.from_cache);
-        assert_eq!(a.hashes, b.hashes);
+        assert_eq!(ha, cached(&b.stat));
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         std::fs::OpenOptions::new()
@@ -319,6 +332,6 @@ mod tests {
 
         let c = hash_files(&cache, ps()).unwrap().pop().unwrap().1.unwrap();
         assert!(!c.from_cache);
-        assert_ne!(b.hashes, c.hashes);
+        assert_ne!(ha, cached(&c.stat));
     }
 }
