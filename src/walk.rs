@@ -36,7 +36,8 @@ fn cloneable_pools() -> Result<HashSet<String>> {
     let out = zfs_cmd(
         "zpool",
         &["get", "-H", "-o", "name,value", "feature@block_cloning"],
-    )?;
+    )
+    .context("query block_cloning pool feature (requires OpenZFS 2.2+)")?;
     let mut pools = HashSet::new();
     for (p, v) in out.lines().filter_map(|l| l.split_once('\t')) {
         if matches!(v, "active" | "enabled") {
