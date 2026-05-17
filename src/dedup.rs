@@ -155,20 +155,41 @@ impl<'a> Worker<'a> {
     }
 
     fn group(&mut self, blksz: u64, locs: &[Loc]) {
-        // First location is the canonical source; everything else gets
-        // cloned from it.
+        // locs[0] is the canonical source: open and read it once,
+        // clone the rest from it.
         let src = locs[0];
+        let len = chunk_len(&self.files[src.file].1, src.chunk, blksz);
+        if len == 0 {
+            return; // past stat.size: file grew after stat
+        }
+        let src_off = src.chunk * blksz;
+        let compare = self.opts.dry_run || !self.opts.fideduperange;
+
+        // Source is read-only: dedup must work on files we can't modify.
+        let prep = |w: &mut Self| -> Result<File> {
+            let sf = w.open(src.file, false)?;
+            if compare {
+                w.buf_a.resize(len as usize, 0);
+                sf.read_exact_at(&mut w.buf_a, src_off)?;
+            }
+            Ok(sf)
+        };
+        let sf = match prep(self) {
+            Ok(f) => f,
+            Err(e) if is_not_found(&e) => return,
+            Err(e) => {
+                eprintln!("skip group {:?}+{src_off}: {e:#}", self.files[src.file].0);
+                self.stats.errors += 1;
+                return;
+            }
+        };
+
         for &dst in &locs[1..] {
-            if src.file == dst.file && src.chunk == dst.chunk {
-                continue;
+            if len != chunk_len(&self.files[dst.file].1, dst.chunk, blksz) {
+                continue; // tail-vs-full mismatch or stale index
             }
             self.stats.candidates += 1;
-            let len = chunk_len(&self.files[src.file].1, src.chunk, blksz);
-            // len == 0: chunk lies past stat.size (file grew after stat).
-            if len == 0 || len != chunk_len(&self.files[dst.file].1, dst.chunk, blksz) {
-                continue;
-            }
-            match self.verify_and_clone(src, dst, blksz, len) {
+            match self.verify_and_clone(&sf, src_off, dst, blksz, len, compare) {
                 Ok(Some(bytes)) => {
                     self.stats.verified += 1;
                     if !self.opts.dry_run {
@@ -181,11 +202,10 @@ impl<'a> Worker<'a> {
                 Err(e) if is_not_found(&e) => {}
                 Err(e) => {
                     eprintln!(
-                        "skip {:?}+{} <- {:?}+{}: {e:#}",
+                        "skip {:?}+{} <- {:?}+{src_off}: {e:#}",
                         self.files[dst.file].0,
                         dst.chunk * blksz,
                         self.files[src.file].0,
-                        src.chunk * blksz,
                     );
                     self.stats.errors += 1;
                 }
@@ -193,39 +213,37 @@ impl<'a> Worker<'a> {
         }
     }
 
-    // Some(bytes deduped) on match, None on mismatch.
+    // Some(bytes deduped) on match, None on mismatch. `compare` selects
+    // userspace verify+FICLONERANGE; otherwise FIDEDUPERANGE in-kernel.
     fn verify_and_clone(
         &mut self,
-        src: Loc,
+        sf: &File,
+        src_off: u64,
         dst: Loc,
         blksz: u64,
         len: u64,
+        compare: bool,
     ) -> Result<Option<u64>> {
-        let src_off = src.chunk * blksz;
         let dst_off = dst.chunk * blksz;
-        // Source is read-only: dedup must work on files we can't modify.
-        let sf = self.open(src.file, false)?;
         let df = self.open(dst.file, true)?;
 
-        if !self.opts.dry_run && self.opts.fideduperange {
-            return match dedupe_range(&sf, src_off, &df, dst_off, len).context("FIDEDUPERANGE")? {
+        if !compare {
+            return match dedupe_range(sf, src_off, &df, dst_off, len).context("FIDEDUPERANGE")? {
                 Dedupe::Same(b) => Ok(Some(b)),
                 Dedupe::Differs => Ok(None),
                 Dedupe::Unsupported => anyhow::bail!("FIDEDUPERANGE unsupported"),
             };
         }
 
-        // No FIDEDUPERANGE: re-read and compare in userspace, then clone.
-        // Racy against concurrent writers, hence --force.
-        self.buf_a.resize(len as usize, 0);
+        // Source chunk is in buf_a from group(). Racy against concurrent
+        // writers, hence --force.
         self.buf_b.resize(len as usize, 0);
-        sf.read_exact_at(&mut self.buf_a, src_off)?;
         df.read_exact_at(&mut self.buf_b, dst_off)?;
         if self.buf_a != self.buf_b {
             return Ok(None);
         }
         if !self.opts.dry_run {
-            clone_range(&sf, src_off, &df, dst_off, len).context("FICLONERANGE")?;
+            clone_range(sf, src_off, &df, dst_off, len).context("FICLONERANGE")?;
         }
         Ok(Some(len))
     }
@@ -362,13 +380,9 @@ mod tests {
             dry_run: false,
             fideduperange: false,
         };
-        let src = Loc { file: 0, chunk: 0 };
-        let dst = Loc { file: 1, chunk: 0 };
-        // FICLONERANGE may fail on the test fs; src open must not.
-        if let Err(e) = Worker::new(&files, opts).verify_and_clone(src, dst, 4096, 4096) {
-            let msg = format!("{e:#}");
-            assert!(msg.contains("FICLONERANGE"), "src open failed: {msg}");
-        }
+        let w = Worker::new(&files, opts);
+        w.open(0, false).expect("read-only source must open");
+        w.open(1, true).expect("writable dest must open");
     }
 
     #[test]
