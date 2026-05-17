@@ -188,9 +188,10 @@ fn run(args: &Args) -> Result<bool> {
 
     // Only prune datasets we scanned in full; a subdir scan covers part
     // of a dataset and must not evict siblings it never visited.
+    let mount_set: HashSet<&PathBuf> = mounts.iter().collect();
     let scanned_fsids: HashSet<u64> = dirs
         .iter()
-        .filter(|d| mounts.contains(d))
+        .filter(|d| mount_set.contains(d))
         .filter_map(|d| walk::fsid(d).ok())
         .collect();
     let pruned = cache.prune(&seen, &scanned_fsids)?;
