@@ -203,7 +203,7 @@ proceed."
     let paths = walk::files(&dirs, &exclude);
     eprintln!("found {} files", paths.len());
 
-    let results = hasher::hash_files(&cache, &paths)?;
+    let results = hasher::hash_files(&cache, paths)?;
     let mut hashed = Vec::with_capacity(results.len());
     let mut seen = HashSet::new();
     let mut hits = 0usize;
@@ -247,6 +247,9 @@ proceed."
     if cache.compact_if_bloated()? {
         eprintln!("compacted cache");
     }
+    // Free what dedup doesn't need; the index alone is large enough.
+    drop(cache);
+    drop(seen);
 
     let stats = dedup::dedup(
         &hashed,

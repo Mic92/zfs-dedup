@@ -67,7 +67,7 @@ fn run_pipeline(data_dir: &Path, cache_path: &Path) -> zfs_dedup::dedup::Stats {
         .map(|p| (p, 0u64))
         .collect();
     paths.sort();
-    let hashed: Vec<_> = hash_files(&cache, &paths)
+    let hashed: Vec<_> = hash_files(&cache, paths)
         .unwrap()
         .into_iter()
         .map(|(p, r)| (p, r.unwrap()))
