@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
@@ -66,20 +66,43 @@ pub type Index = HashMap<(u32, ChunkHash), Vec<Loc>, BuildHasherDefault<ChunkKey
 
 // One candidate group per (blksz, hash). zfs_clone_range refuses
 // cross-blocksize clones, so files with different blksz never share.
+//
+// Two passes: mark which (blksz, hash) keys repeat, then collect
+// locations only for those. Building a Vec per chunk and discarding
+// the singletons would transiently allocate several times the final
+// index size on low-dup trees.
 pub fn build_index(files: &[(PathBuf, Hashed)]) -> Index {
+    type KeySet = HashSet<(u32, ChunkHash), BuildHasherDefault<ChunkKeyHasher>>;
+    let mut seen = KeySet::default();
+    let mut dup = KeySet::default();
+    for (_, h) in files {
+        for hash in &h.hashes {
+            if *hash == ZERO_HASH {
+                continue;
+            }
+            let key = (h.stat.blksz, *hash);
+            if !seen.insert(key) {
+                dup.insert(key);
+            }
+        }
+    }
+    drop(seen);
+
     let mut idx = Index::default();
     for (fi, (_, h)) in files.iter().enumerate() {
         for (ci, hash) in h.hashes.iter().enumerate() {
             if *hash == ZERO_HASH {
                 continue;
             }
-            idx.entry((h.stat.blksz, *hash)).or_default().push(Loc {
-                file: fi,
-                chunk: ci as u64,
-            });
+            let key = (h.stat.blksz, *hash);
+            if dup.contains(&key) {
+                idx.entry(key).or_default().push(Loc {
+                    file: fi,
+                    chunk: ci as u64,
+                });
+            }
         }
     }
-    idx.retain(|_, v| v.len() > 1);
     idx
 }
 
