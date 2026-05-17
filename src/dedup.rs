@@ -64,6 +64,14 @@ impl Hasher for ChunkKeyHasher {
 
 pub type Index = HashMap<(u32, ChunkHash), Vec<Loc>, BuildHasherDefault<ChunkKeyHasher>>;
 
+// Truncated key for the seen/dup pre-filter; halves its footprint.
+// A collision only marks a singleton as a possible dup; pass 2 indexes
+// by full key so the false group has one location and is a no-op.
+fn dup_key(blksz: u32, h: &ChunkHash) -> u64 {
+    u64::from_le_bytes(h[8..16].try_into().expect("16-byte hash"))
+        ^ u64::from(blksz).wrapping_mul(0x9e3779b97f4a7c15)
+}
+
 // One candidate group per (blksz, hash). zfs_clone_range refuses
 // cross-blocksize clones, so files with different blksz never share.
 //
@@ -72,17 +80,17 @@ pub type Index = HashMap<(u32, ChunkHash), Vec<Loc>, BuildHasherDefault<ChunkKey
 // the singletons would transiently allocate several times the final
 // index size on low-dup trees.
 pub fn build_index(files: &[(PathBuf, Hashed)]) -> Index {
-    type KeySet = HashSet<(u32, ChunkHash), BuildHasherDefault<ChunkKeyHasher>>;
-    let mut seen = KeySet::default();
-    let mut dup = KeySet::default();
+    type Pre = HashSet<u64, BuildHasherDefault<ChunkKeyHasher>>;
+    let mut seen = Pre::default();
+    let mut dup = Pre::default();
     for (_, h) in files {
         for hash in &h.hashes {
             if *hash == ZERO_HASH {
                 continue;
             }
-            let key = (h.stat.blksz, *hash);
-            if !seen.insert(key) {
-                dup.insert(key);
+            let k = dup_key(h.stat.blksz, hash);
+            if !seen.insert(k) {
+                dup.insert(k);
             }
         }
     }
@@ -91,18 +99,18 @@ pub fn build_index(files: &[(PathBuf, Hashed)]) -> Index {
     let mut idx = Index::default();
     for (fi, (_, h)) in files.iter().enumerate() {
         for (ci, hash) in h.hashes.iter().enumerate() {
-            if *hash == ZERO_HASH {
+            if *hash == ZERO_HASH || !dup.contains(&dup_key(h.stat.blksz, hash)) {
                 continue;
             }
-            let key = (h.stat.blksz, *hash);
-            if dup.contains(&key) {
-                idx.entry(key).or_default().push(Loc {
-                    file: fi,
-                    chunk: ci as u64,
-                });
-            }
+            idx.entry((h.stat.blksz, *hash)).or_default().push(Loc {
+                file: fi,
+                chunk: ci as u64,
+            });
         }
     }
+    // Truncated-key collisions in `dup` make singletons here; drop them
+    // so group() doesn't open+read a source with nothing to clone to.
+    idx.retain(|_, v| v.len() > 1);
     idx
 }
 
@@ -377,6 +385,25 @@ mod tests {
             h.stat.size = 0;
         }
         assert_eq!(dedup(&files, DRY).verified, 0);
+    }
+
+    // Two distinct chunk hashes that share the upper 8 bytes collide on
+    // dup_key but must not become a dedup candidate.
+    #[test]
+    fn dup_key_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = [
+            fixture(dir.path(), "a", &[1u8; 4096], 4096),
+            fixture(dir.path(), "b", &[2u8; 4096], 4096),
+        ];
+        files[0].1.hashes[0] = [0xaa; 16];
+        files[1].1.hashes[0] = [0xbb; 16];
+        files[1].1.hashes[0][8..].copy_from_slice(&[0xaa; 8]);
+        assert_eq!(
+            dup_key(4096, &files[0].1.hashes[0]),
+            dup_key(4096, &files[1].1.hashes[0]),
+        );
+        assert_eq!(dedup(&files, DRY).candidates, 0);
     }
 
     #[test]
