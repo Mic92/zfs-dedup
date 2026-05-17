@@ -64,6 +64,7 @@ fn run_pipeline(data_dir: &Path, cache_path: &Path) -> zfs_dedup::dedup::Stats {
         .unwrap()
         .map(|e| e.unwrap().path())
         .filter(|p| p.is_file())
+        .map(|p| (p, 0u64))
         .collect();
     paths.sort();
     let hashed: Vec<_> = hash_files(&cache, &paths)
@@ -96,7 +97,7 @@ fn pattern(seed: u64) -> [u8; 131072] {
 fn index(b: Bencher, n_chunks: u32) {
     // Synthetic file with all-unique chunks: worst case for the hashmap.
     let stat = Stat {
-        dev: 1,
+        fsid: 1,
         ino: 1,
         size: n_chunks as u64 * 131072,
         mtime_ns: 0,

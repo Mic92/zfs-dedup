@@ -16,7 +16,7 @@ pub const ZERO_HASH: ChunkHash = [0u8; HASH_LEN];
 
 #[derive(Debug, Clone, Copy)]
 pub struct Stat {
-    pub dev: u64,
+    pub fsid: u64, // dataset id, see walk::fsid
     pub ino: u64,
     pub size: u64,
     pub mtime_ns: i128,
@@ -25,9 +25,9 @@ pub struct Stat {
 }
 
 impl Stat {
-    pub fn from_metadata(m: &std::fs::Metadata) -> Self {
+    pub fn from_metadata(m: &std::fs::Metadata, fsid: u64) -> Self {
         Self {
-            dev: m.dev(),
+            fsid,
             ino: m.ino(),
             size: m.size(),
             mtime_ns: i128::from(m.mtime()) * 1_000_000_000 + i128::from(m.mtime_nsec()),
@@ -103,10 +103,13 @@ pub struct Hashed {
     pub from_cache: bool,
 }
 
-pub fn hash_files(cache: &Cache, paths: &[PathBuf]) -> Result<Vec<(PathBuf, Result<Hashed>)>> {
+pub fn hash_files(
+    cache: &Cache,
+    paths: &[(PathBuf, u64)],
+) -> Result<Vec<(PathBuf, Result<Hashed>)>> {
     let results: Vec<_> = paths
         .par_iter()
-        .map(|p| (p.clone(), hash_one(cache, p)))
+        .map(|(p, fsid)| (p.clone(), hash_one(cache, p, *fsid)))
         .collect();
 
     cache.put_many(
@@ -116,7 +119,7 @@ pub fn hash_files(cache: &Cache, paths: &[PathBuf]) -> Result<Vec<(PathBuf, Resu
             .filter(|h| !h.from_cache)
             .map(|h| {
                 (
-                    h.stat.dev,
+                    h.stat.fsid,
                     h.stat.ino,
                     EntryRef {
                         size: h.stat.size,
@@ -131,12 +134,12 @@ pub fn hash_files(cache: &Cache, paths: &[PathBuf]) -> Result<Vec<(PathBuf, Resu
     Ok(results)
 }
 
-fn hash_one(cache: &Cache, path: &Path) -> Result<Hashed> {
+fn hash_one(cache: &Cache, path: &Path, fsid: u64) -> Result<Hashed> {
     let meta = std::fs::symlink_metadata(path).with_context(|| format!("stat {path:?}"))?;
     ensure!(meta.is_file(), "not a regular file: {path:?}");
-    let stat = Stat::from_metadata(&meta);
+    let stat = Stat::from_metadata(&meta, fsid);
 
-    if let Some(entry) = cache.get(stat.dev, stat.ino)?
+    if let Some(entry) = cache.get(stat.fsid, stat.ino)?
         && entry.matches(stat.size, stat.mtime_ns, stat.ctime_ns, stat.blksz)
     {
         return Ok(Hashed {
@@ -202,12 +205,12 @@ mod tests {
         let cache = Cache::open(&dir.path().join("c.redb")).unwrap();
         let p = dir.path().join("f");
         std::fs::write(&p, vec![7; 8192]).unwrap();
-        let ps = std::slice::from_ref(&p);
+        let ps = [(p.clone(), 0u64)];
 
-        let a = hash_files(&cache, ps).unwrap().pop().unwrap().1.unwrap();
+        let a = hash_files(&cache, &ps).unwrap().pop().unwrap().1.unwrap();
         assert!(!a.from_cache);
 
-        let b = hash_files(&cache, ps).unwrap().pop().unwrap().1.unwrap();
+        let b = hash_files(&cache, &ps).unwrap().pop().unwrap().1.unwrap();
         assert!(b.from_cache);
         assert_eq!(a.hashes, b.hashes);
 
@@ -219,7 +222,7 @@ mod tests {
             .write_all(&[1; 4096])
             .unwrap();
 
-        let c = hash_files(&cache, ps).unwrap().pop().unwrap().1.unwrap();
+        let c = hash_files(&cache, &ps).unwrap().pop().unwrap().1.unwrap();
         assert!(!c.from_cache);
         assert_ne!(b.hashes, c.hashes);
     }
