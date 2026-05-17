@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, TableDefinition};
 
 pub const HASH_LEN: usize = 16;
 pub type ChunkHash = [u8; HASH_LEN];
@@ -132,19 +132,16 @@ impl Cache {
     // keeps a partial scan from evicting cache for trees it never visited.
     pub fn prune(&self, seen: &HashSet<(u64, u64)>, fsids: &HashSet<u64>) -> Result<usize> {
         let tx = self.db.begin_write()?;
-        let removed;
+        let mut removed = 0;
         {
             let mut table = tx.open_table(FILES)?;
-            let stale: Vec<_> = table
-                .iter()?
-                .filter_map(|r| r.ok())
-                .map(|(k, _)| k.value())
-                .filter(|k| fsids.contains(&k.0) && !seen.contains(k))
-                .collect();
-            removed = stale.len();
-            for k in stale {
-                table.remove(k)?;
-            }
+            table.retain(|k, _| {
+                let keep = !fsids.contains(&k.0) || seen.contains(&k);
+                if !keep {
+                    removed += 1;
+                }
+                keep
+            })?;
         }
         tx.commit()?;
         Ok(removed)
