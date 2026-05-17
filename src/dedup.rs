@@ -114,10 +114,10 @@ impl<'a> Worker<'a> {
         }
     }
 
-    fn open(&self, i: usize) -> Result<File> {
+    fn open(&self, i: usize, write: bool) -> Result<File> {
         File::options()
             .read(true)
-            .write(!self.opts.dry_run)
+            .write(write && !self.opts.dry_run)
             .open(&self.files[i].0)
             .with_context(|| format!("open {:?}", self.files[i].0))
     }
@@ -164,8 +164,9 @@ impl<'a> Worker<'a> {
     fn verify_and_clone(&mut self, src: Loc, dst: Loc, blksz: u64, len: u64) -> Result<bool> {
         let src_off = src.chunk as u64 * blksz;
         let dst_off = dst.chunk as u64 * blksz;
-        let sf = self.open(src.file)?;
-        let df = self.open(dst.file)?;
+        // Source is read-only: dedup must work on files we can't modify.
+        let sf = self.open(src.file, false)?;
+        let df = self.open(dst.file, true)?;
 
         if !self.opts.dry_run && self.opts.fideduperange {
             return match dedupe_range(&sf, src_off, &df, dst_off, len).context("FIDEDUPERANGE")? {
@@ -305,6 +306,30 @@ mod tests {
             fixture(dir.path(), "b", &z, 4096),
         ];
         assert_eq!(dedup(&files, DRY).candidates, 0);
+    }
+
+    #[test]
+    fn readonly_source() {
+        // Source is never written to; mode 0400 must not fail the open.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let data = [9u8; 4096];
+        let files = [
+            fixture(dir.path(), "ro", &data, 4096),
+            fixture(dir.path(), "rw", &data, 4096),
+        ];
+        std::fs::set_permissions(&files[0].0, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let opts = Opts {
+            dry_run: false,
+            fideduperange: false,
+        };
+        let src = Loc { file: 0, chunk: 0 };
+        let dst = Loc { file: 1, chunk: 0 };
+        // FICLONERANGE may fail on the test fs; src open must not.
+        if let Err(e) = Worker::new(&files, opts).verify_and_clone(src, dst, 4096, 4096) {
+            let msg = format!("{e:#}");
+            assert!(msg.contains("FICLONERANGE"), "src open failed: {msg}");
+        }
     }
 
     #[test]
