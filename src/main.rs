@@ -102,6 +102,19 @@ fn human(b: u64) -> String {
     }
 }
 
+// The probe writes; try each dir until one accepts it so a read-only or
+// full first dataset doesn't abort the run. The answer is per-kernel,
+// not per-dataset, so the first definitive result wins.
+fn probe_fideduperange(dirs: &BTreeSet<PathBuf>) -> bool {
+    for d in dirs {
+        match clone::probe_dedupe(d) {
+            Ok(b) => return b,
+            Err(e) => eprintln!("probe FIDEDUPERANGE in {}: {e}", d.display()),
+        }
+    }
+    false
+}
+
 fn run(args: &Args) -> Result<bool> {
     if let Some(parent) = args.cache.parent() {
         std::fs::create_dir_all(parent)?;
@@ -139,11 +152,10 @@ fn run(args: &Args) -> Result<bool> {
 
     // FIDEDUPERANGE compares and clones under inode locks; without it
     // there's a window between our compare and the clone.
-    let fideduperange =
-        !args.dry_run && clone::probe_dedupe(dirs.first().expect("dirs non-empty"))?;
+    let fideduperange = !args.dry_run && probe_fideduperange(&dirs);
     if !args.dry_run && !fideduperange && !args.force {
         bail!(
-            "kernel lacks FIDEDUPERANGE; falling back to FICLONERANGE is \
+            "FIDEDUPERANGE unavailable; falling back to FICLONERANGE is \
              racy against concurrent writers. Pass --force to do it anyway."
         );
     }
