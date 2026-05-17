@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use redb::{Database, ReadableDatabase, TableDefinition};
@@ -99,6 +99,7 @@ impl FileEntry {
 
 pub struct Cache {
     db: Database,
+    path: PathBuf,
 }
 
 impl Cache {
@@ -107,7 +108,10 @@ impl Cache {
         let tx = db.begin_write()?;
         tx.open_table(FILES)?;
         tx.commit()?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            path: path.to_owned(),
+        })
     }
 
     pub fn get(&self, fsid: u64, ino: u64) -> Result<Option<FileEntry>> {
@@ -158,6 +162,27 @@ impl Cache {
         }
         tx.commit()?;
         Ok(removed)
+    }
+
+    // Reclaim file space when more than half the file is freed pages.
+    // redb reuses them internally but never shrinks the file, so a big
+    // prune leaves it at peak size. Compaction is slow; the floor keeps
+    // small caches from rewriting for a few wasted MiB.
+    pub fn compact_if_bloated(&mut self) -> Result<bool> {
+        const FLOOR: u64 = 16 << 20;
+        let file = std::fs::metadata(&self.path)?.len();
+        // stored + metadata = live data; allocated_pages also counts
+        // the free list and overstates use right after a prune.
+        let used = {
+            let tx = self.db.begin_write()?;
+            let s = tx.stats()?;
+            tx.abort()?;
+            s.stored_bytes() + s.metadata_bytes()
+        };
+        if file > used.saturating_mul(2) && file.saturating_sub(used) > FLOOR {
+            return Ok(self.db.compact()?);
+        }
+        Ok(false)
     }
 }
 
@@ -238,6 +263,21 @@ mod tests {
         assert!(cache.get(0, 2).unwrap().is_none());
         assert!(cache.get(0, 3).unwrap().is_some());
         assert!(cache.get(0, 4).unwrap().is_none());
+    }
+
+    #[test]
+    fn compact_if_bloated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = Cache::open(&dir.path().join("c.redb")).unwrap();
+        assert!(!cache.compact_if_bloated().unwrap(), "fresh cache");
+        // Grow past FLOOR, prune all, expect compaction once.
+        let e = entry(1024); // ~16 KiB
+        cache
+            .put_many((0..2000).map(|i| (0, i, e.as_ref())))
+            .unwrap();
+        cache.prune(&HashSet::new(), &[0].into()).unwrap();
+        assert!(cache.compact_if_bloated().unwrap(), "after big prune");
+        assert!(!cache.compact_if_bloated().unwrap(), "already compacted");
     }
 
     #[test]

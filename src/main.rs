@@ -119,7 +119,7 @@ fn run(args: &Args) -> Result<bool> {
     if let Some(parent) = args.cache.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let cache =
+    let mut cache =
         Cache::open(&args.cache).with_context(|| format!("open cache {}", args.cache.display()))?;
 
     // Every ZFS dataset is its own mount and the walk stops at mount
@@ -209,6 +209,9 @@ fn run(args: &Args) -> Result<bool> {
     let pruned = cache.prune(&seen, &scanned_fsids)?;
     if pruned > 0 {
         eprintln!("pruned {pruned} stale cache entries");
+    }
+    if cache.compact_if_bloated()? {
+        eprintln!("compacted cache");
     }
 
     let stats = dedup::dedup(
