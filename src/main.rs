@@ -175,8 +175,15 @@ fn run(args: &Args, private_ns: bool) -> Result<bool> {
     let fideduperange = !args.dry_run && probe_fideduperange(&dirs);
     if !args.dry_run && !fideduperange && !args.force {
         bail!(
-            "FIDEDUPERANGE unavailable; falling back to FICLONERANGE is \
-             racy against concurrent writers. Pass --force to do it anyway."
+            "\
+This ZFS doesn't support FIDEDUPERANGE, the in-kernel atomic
+verify-and-clone (stock OpenZFS doesn't yet). The FICLONERANGE fallback
+compares blocks in userspace before cloning; a write that lands between
+the compare and the clone is silently lost.
+
+This is safe when nothing is writing to the scanned files: idle
+datasets, archives, read-only trees like /nix/store. Pass --force to
+proceed."
         );
     }
 
