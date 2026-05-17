@@ -170,11 +170,16 @@ pub struct Hashed {
 
 pub fn hash_files(
     cache: &Cache,
-    paths: &[(PathBuf, u64)],
+    paths: Vec<(PathBuf, u64)>,
 ) -> Result<Vec<(PathBuf, Result<Hashed>)>> {
+    // Take ownership so the path lives once: in the result, not also
+    // in a caller-held source vec.
     let results: Vec<_> = paths
-        .par_iter()
-        .map(|(p, fsid)| (p.clone(), hash_one(cache, p, *fsid)))
+        .into_par_iter()
+        .map(|(p, fsid)| {
+            let r = hash_one(cache, &p, fsid);
+            (p, r)
+        })
         .collect();
 
     cache.put_many(
@@ -293,12 +298,12 @@ mod tests {
         let cache = Cache::open(&dir.path().join("c.redb")).unwrap();
         let p = dir.path().join("f");
         std::fs::write(&p, vec![7; 8192]).unwrap();
-        let ps = [(p.clone(), 0u64)];
+        let ps = || vec![(p.clone(), 0u64)];
 
-        let a = hash_files(&cache, &ps).unwrap().pop().unwrap().1.unwrap();
+        let a = hash_files(&cache, ps()).unwrap().pop().unwrap().1.unwrap();
         assert!(!a.from_cache);
 
-        let b = hash_files(&cache, &ps).unwrap().pop().unwrap().1.unwrap();
+        let b = hash_files(&cache, ps()).unwrap().pop().unwrap().1.unwrap();
         assert!(b.from_cache);
         assert_eq!(a.hashes, b.hashes);
 
@@ -310,7 +315,7 @@ mod tests {
             .write_all(&[1; 4096])
             .unwrap();
 
-        let c = hash_files(&cache, &ps).unwrap().pop().unwrap().1.unwrap();
+        let c = hash_files(&cache, ps()).unwrap().pop().unwrap().1.unwrap();
         assert!(!c.from_cache);
         assert_ne!(b.hashes, c.hashes);
     }
