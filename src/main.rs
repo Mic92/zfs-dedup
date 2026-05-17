@@ -201,10 +201,12 @@ proceed."
         .into_iter()
         .collect();
     let paths = walk::files(&dirs, &exclude);
-    eprintln!("found {} files", paths.files.len());
+    let n_files = paths.files.len();
+    eprintln!("found {n_files} files");
 
     let results = hasher::hash_files(&cache, paths)?;
-    let mut seen = HashSet::new();
+    // Pre-size to skip the rehash spike (old + new tables both live).
+    let mut seen = HashSet::with_capacity(n_files);
     let mut hits = 0usize;
     let mut hash_errors = 0usize;
     let hashed = results.filter_map(|p, r, arena| match r {
