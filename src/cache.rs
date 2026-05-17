@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use redb::{Database, ReadableDatabase, TableDefinition};
 
 pub const HASH_LEN: usize = 16;
@@ -118,7 +118,9 @@ impl Cache {
         let tx = self.db.begin_read()?;
         let table = tx.open_table(FILES)?;
         match table.get((fsid, ino))? {
-            Some(v) => Ok(Some(FileEntry::decode(v.value())?)),
+            Some(v) => FileEntry::decode(v.value())
+                .with_context(|| format!("delete {} to rebuild the cache", self.path.display()))
+                .map(Some),
             None => Ok(None),
         }
     }

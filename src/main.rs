@@ -126,8 +126,12 @@ fn run(args: &Args, private_ns: bool) -> Result<bool> {
     if let Some(parent) = args.cache.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut cache =
-        Cache::open(&args.cache).with_context(|| format!("open cache {}", args.cache.display()))?;
+    let mut cache = Cache::open(&args.cache).with_context(|| {
+        format!(
+            "open cache {} (another zfs-dedup running, or stale lock?)",
+            args.cache.display()
+        )
+    })?;
 
     // Every ZFS dataset is its own mount and the walk stops at mount
     // boundaries, so collect each dataset under the requested roots
@@ -166,7 +170,10 @@ fn run(args: &Args, private_ns: bool) -> Result<bool> {
         ok
     });
     if dirs.is_empty() {
-        bail!("no mounted ZFS datasets found");
+        bail!(
+            "nothing to scan: no mounted ZFS datasets on a writable, \
+             block_cloning-capable pool (see skip messages above, if any)"
+        );
     }
     eprintln!("scanning {} ZFS mountpoints", dirs.len());
 
