@@ -1,11 +1,14 @@
+use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
 use std::fs::File;
 use std::io::Read;
+use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 
 use anyhow::{Context, Result, ensure};
 use rayon::prelude::*;
-use rustix::fs::OFlags;
+use rustix::fs::{OFlags, fcntl_setfl};
 
 use crate::cache::{Cache, ChunkHash, EntryRef, HASH_LEN};
 
@@ -50,6 +53,50 @@ fn open_nofollow(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
+// Page-aligned heap buffer; required for O_DIRECT reads.
+struct AlignedBuf {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+impl AlignedBuf {
+    fn new(len: usize) -> Self {
+        let layout = Layout::from_size_align(len.max(1), 4096).expect("valid layout");
+        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })
+            .unwrap_or_else(|| handle_alloc_error(layout));
+        Self { ptr, layout }
+    }
+}
+
+impl Deref for AlignedBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.layout.size()) }
+    }
+}
+
+impl DerefMut for AlignedBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
+    }
+}
+
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) }
+    }
+}
+
+// Best-effort O_DIRECT: bypass the ARC so a cold scan over TBs doesn't
+// evict the system's hot data. ZFS 2.3+ honours it (direct=standard
+// default); older ZFS and other fses ignore or refuse it, which we
+// ignore. Reads must be page-multiple, hence the blksz guard.
+fn try_o_direct(f: &File, blksz: u32) {
+    if blksz.is_multiple_of(4096) {
+        let _ = fcntl_setfl(f, OFlags::DIRECT | OFlags::NONBLOCK);
+    }
+}
+
 // Chunk boundaries follow st_blksize so the hashes line up with ranges
 // FICLONERANGE will accept. XXH3-128 is non-crypto; we always byte-verify
 // candidate pairs before cloning, so the hash only has to keep the false-
@@ -57,12 +104,13 @@ fn open_nofollow(path: &Path) -> std::io::Result<File> {
 // site.
 pub fn hash_file(path: &Path, blksz: u32) -> Result<Vec<ChunkHash>> {
     let f = open_nofollow(path).with_context(|| format!("open {path:?}"))?;
+    try_o_direct(&f, blksz);
     hash_fd(&f, blksz)
 }
 
 fn hash_fd(mut f: impl Read, blksz: u32) -> Result<Vec<ChunkHash>> {
     ensure!(blksz > 0, "blksz must be > 0");
-    let mut buf = vec![0u8; blksz as usize];
+    let mut buf = AlignedBuf::new(blksz as usize);
     let mut hashes = Vec::new();
     loop {
         let n = read_full(&mut f, &mut buf)?;
@@ -167,6 +215,7 @@ fn hash_one(cache: &Cache, path: &Path, fsid: u64) -> Result<Hashed> {
         });
     }
 
+    try_o_direct(&f, stat.blksz);
     Ok(Hashed {
         stat,
         hashes: hash_fd(&f, stat.blksz)?,
@@ -207,6 +256,17 @@ mod tests {
         assert!(is_zero(&[0; 4096]));
         assert!(!is_zero(&[0, 0, 0, 1]));
         assert!(!is_zero(&[1, 0, 0, 0]));
+    }
+
+    #[test]
+    fn aligned_buf() {
+        for n in [1, 4096, 4097, 131072] {
+            let mut b = AlignedBuf::new(n);
+            assert_eq!(b.len(), n);
+            assert_eq!(b.as_ptr() as usize % 4096, 0, "misaligned at n={n}");
+            b.fill(0xab);
+            assert!(b.iter().all(|&x| x == 0xab));
+        }
     }
 
     #[test]
