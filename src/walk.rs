@@ -47,8 +47,12 @@ pub fn fsid(p: &Path) -> Result<u64> {
 // Collect regular files tagged with their dataset fsid. Hardlinked sets
 // are collapsed to one path: same inode means already-shared storage, and
 // zfs_clone_range would just hit the same dnode. Symlinks not followed.
-pub fn files<'a>(roots: impl IntoIterator<Item = &'a PathBuf>) -> Vec<(PathBuf, u64)> {
-    let mut seen: HashSet<(u64, u64)> = HashSet::new();
+// `exclude` pre-seeds the seen set, e.g. to skip our own cache file.
+pub fn files<'a>(
+    roots: impl IntoIterator<Item = &'a PathBuf>,
+    exclude: &HashSet<(u64, u64)>,
+) -> Vec<(PathBuf, u64)> {
+    let mut seen = exclude.clone();
     let mut out = Vec::new();
     for root in roots {
         let stat = || anyhow::Ok((std::fs::metadata(root)?.dev(), fsid(root)?));
@@ -138,19 +142,27 @@ mod tests {
         std::fs::write(p.join("sub/c"), b"z").unwrap();
         std::os::unix::fs::symlink(p.join("a"), p.join("alink")).unwrap();
 
-        let mut seen = HashSet::new();
-        let mut got_paths = Vec::new();
         let dev = std::fs::metadata(p).unwrap().dev();
-        super::walk_root(p, dev, 0, &mut seen, &mut got_paths);
-        let mut got: Vec<_> = got_paths
-            .into_iter()
-            .map(|(f, _)| f.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        got.sort();
+        let names = |excl: &HashSet<(u64, u64)>| {
+            let mut seen = excl.clone();
+            let mut out = Vec::new();
+            super::walk_root(p, dev, 0, &mut seen, &mut out);
+            out.into_iter()
+                .map(|(f, _)| f.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let got = names(&HashSet::new());
         // a/a2 collapse to one (whichever jwalk hits first), plus b and sub/c.
         assert_eq!(got.len(), 3);
         assert!(got.contains(&"b".into()));
         assert!(got.contains(&"c".into()));
         assert!(got.contains(&"a".into()) || got.contains(&"a2".into()));
+
+        // Exclude b by (dev, ino).
+        let bm = std::fs::metadata(p.join("b")).unwrap();
+        let got = names(&[(bm.dev(), bm.ino())].into());
+        assert_eq!(got.len(), 2);
+        assert!(!got.contains(&"b".into()));
     }
 }
