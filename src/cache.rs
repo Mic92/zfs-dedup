@@ -38,15 +38,25 @@ pub struct EntryRef<'a> {
 
 const HEADER: usize = 8 + 16 + 16 + 4;
 
-fn encode(e: EntryRef) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(HEADER + e.hashes.len() * HASH_LEN);
-    buf.extend_from_slice(&e.size.to_le_bytes());
-    buf.extend_from_slice(&e.mtime_ns.to_le_bytes());
-    buf.extend_from_slice(&e.ctime_ns.to_le_bytes());
-    buf.extend_from_slice(&e.blksz.to_le_bytes());
-    for h in e.hashes {
-        buf.extend_from_slice(h);
+fn encoded_len(e: EntryRef) -> usize {
+    HEADER + e.hashes.len() * HASH_LEN
+}
+
+fn encode_into(buf: &mut [u8], e: EntryRef) {
+    debug_assert_eq!(buf.len(), encoded_len(e));
+    buf[0..8].copy_from_slice(&e.size.to_le_bytes());
+    buf[8..24].copy_from_slice(&e.mtime_ns.to_le_bytes());
+    buf[24..40].copy_from_slice(&e.ctime_ns.to_le_bytes());
+    buf[40..44].copy_from_slice(&e.blksz.to_le_bytes());
+    for (dst, h) in buf[HEADER..].chunks_exact_mut(HASH_LEN).zip(e.hashes) {
+        dst.copy_from_slice(h);
     }
+}
+
+#[cfg(test)]
+fn encode(e: EntryRef) -> Vec<u8> {
+    let mut buf = vec![0u8; encoded_len(e)];
+    encode_into(&mut buf, e);
     buf
 }
 
@@ -113,6 +123,8 @@ impl Cache {
         self.put_many([(fsid, ino, entry)])
     }
 
+    // insert_reserve writes directly into the redb page; encode() into a
+    // Vec first would alloc + memcpy ~1 KiB per file.
     pub fn put_many<'a>(
         &self,
         entries: impl IntoIterator<Item = (u64, u64, EntryRef<'a>)>,
@@ -121,7 +133,8 @@ impl Cache {
         {
             let mut table = tx.open_table(FILES)?;
             for (fsid, ino, e) in entries {
-                table.insert((fsid, ino), encode(e).as_slice())?;
+                let mut g = table.insert_reserve((fsid, ino), encoded_len(e))?;
+                encode_into(g.as_mut(), e);
             }
         }
         tx.commit()?;
