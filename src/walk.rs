@@ -198,6 +198,10 @@ pub fn files<'a>(
         };
         walk_root(root, dev, fsid, exclude, &mut seen, &mut out);
     }
+    // Both grew without a size hint; doubling leaves ~33% slack. The
+    // realloc here returns it before hashing inflates RSS further.
+    out.files.shrink_to_fit();
+    out.arena.shrink_to_fit();
     out
 }
 
