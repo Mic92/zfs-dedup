@@ -99,6 +99,10 @@ pub fn files<'a>(
     out
 }
 
+// (dev, ino, nlink) carried out of the parallel jwalk callback so the
+// serial consumer doesn't re-stat every file.
+type FileMeta = Option<(u64, u64, u64)>;
+
 fn walk_root(
     root: &Path,
     root_dev: u64,
@@ -107,19 +111,42 @@ fn walk_root(
     seen: &mut HashSet<(u64, u64)>,
     out: &mut Vec<(PathBuf, u64)>,
 ) {
-    // Prune the walk at mount boundaries; child datasets get their own
-    // walk_root call from main.
-    for entry in jwalk::WalkDir::new(root)
+    // process_read_dir runs on rayon threads: stat there so the per-file
+    // syscall is parallel. The for loop below is single-threaded and
+    // must only touch what the callback already collected.
+    for entry in jwalk::WalkDirGeneric::<((), FileMeta)>::new(root)
         .skip_hidden(false)
         .follow_links(false)
         .sort(false)
         .process_read_dir(move |_, _, _, children| {
             for c in children.iter_mut().flatten() {
-                // On stat error, descend anyway: the per-file dev check
-                // catches real boundary crossings, and pruning silently
-                // would drop the subtree from the scan.
-                if c.file_type().is_dir() && c.metadata().is_ok_and(|m| m.dev() != root_dev) {
-                    c.read_children_path = None;
+                let ft = c.file_type();
+                if !ft.is_dir() && !ft.is_file() {
+                    continue;
+                }
+                let m = match c.metadata() {
+                    Ok(m) => m,
+                    // Files vanish mid-walk; not an error. On other
+                    // errors leave client_state None: the consumer skips
+                    // the file, but a dir is still descended -- pruning
+                    // silently would drop the subtree.
+                    Err(e) => {
+                        if e.io_error()
+                            .is_none_or(|io| io.kind() != ErrorKind::NotFound)
+                        {
+                            eprintln!("walk: {}: {e}", c.path().display());
+                        }
+                        continue;
+                    }
+                };
+                if ft.is_dir() {
+                    // Prune at mount boundaries; child datasets get
+                    // their own walk_root call from main.
+                    if m.dev() != root_dev {
+                        c.read_children_path = None;
+                    }
+                } else {
+                    c.client_state = Some((m.dev(), m.ino(), m.nlink()));
                 }
             }
         })
@@ -138,31 +165,18 @@ fn walk_root(
                 continue;
             }
         };
-        if !entry.file_type().is_file() {
+        let Some((dev, ino, nlink)) = entry.client_state else {
             continue;
-        }
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(e)
-                if e.io_error()
-                    .is_some_and(|io| io.kind() == ErrorKind::NotFound) =>
-            {
-                continue;
-            }
-            Err(e) => {
-                eprintln!("walk: {}: {e}", entry.path().display());
-                continue;
-            }
         };
         // Stay on the root filesystem; a different dev means we crossed
         // a mount point, which could be non-ZFS or a different pool.
-        if meta.dev() != root_dev || exclude.contains(&(meta.dev(), meta.ino())) {
+        if dev != root_dev || exclude.contains(&(dev, ino)) {
             continue;
         }
         // `seen` exists to dedup hardlinks. Files with nlink == 1 have
         // no aliases, so don't pay HashSet memory for them; that's most
         // of any tree.
-        if meta.nlink() > 1 && !seen.insert((meta.dev(), meta.ino())) {
+        if nlink > 1 && !seen.insert((dev, ino)) {
             continue;
         }
         out.push((entry.path(), fsid));
