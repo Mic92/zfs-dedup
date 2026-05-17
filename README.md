@@ -5,6 +5,15 @@ deduplication. Scans your datasets, finds blocks with identical
 content, and reflinks them with block cloning. Runs offline, no DDT,
 no extra RAM.
 
+```
+% sudo zfs-dedup ~/
+scanning 1 ZFS mountpoints
+found 8329094 files
+hashed 8329094 files (4977666 from cache), 882.3 GiB total
+pruned 97 stale cache entries
+saved 79.0 GiB (9.0%) across 3860361 blocks, 0 mismatches, 0 errors
+```
+
 ## Install
 
 ```
