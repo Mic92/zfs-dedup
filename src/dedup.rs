@@ -69,25 +69,30 @@ impl Hasher for ChunkKeyHasher {
     fn write_u32(&mut self, n: u32) {
         self.0 ^= u64::from(n).wrapping_mul(0x9e3779b97f4a7c15);
     }
+    fn write_u64(&mut self, n: u64) {
+        self.0 ^= n.wrapping_mul(0x9e3779b97f4a7c15);
+    }
 }
 
-pub type Index = HashMap<(u32, ChunkHash), Vec<Loc>, BuildHasherDefault<ChunkKeyHasher>>;
+// One candidate group per (blksz, fsid, hash). zfs_clone_range refuses
+// cross-blocksize clones, and the VFS refuses cross-superblock (each
+// dataset is one) FIDEDUPERANGE/FICLONERANGE with EXDEV, so neither
+// pair can ever clone.
+pub type Index = HashMap<(u32, u64, ChunkHash), Vec<Loc>, BuildHasherDefault<ChunkKeyHasher>>;
 
 // Truncated key for the seen/dup pre-filter; halves its footprint.
 // A collision only marks a singleton as a possible dup; pass 2 indexes
 // by full key so the false group has one location and is a no-op.
-fn dup_key(blksz: u32, h: &ChunkHash) -> u64 {
+fn dup_key(blksz: u32, fsid: u64, h: &ChunkHash) -> u64 {
     u64::from_le_bytes(h[8..16].try_into().expect("16-byte hash"))
         ^ u64::from(blksz).wrapping_mul(0x9e3779b97f4a7c15)
+        ^ fsid.wrapping_mul(0xff51afd7ed558ccd)
 }
 
-// One candidate group per (blksz, hash). zfs_clone_range refuses
-// cross-blocksize clones, so files with different blksz never share.
-//
-// Two passes: mark which (blksz, hash) keys repeat, then collect
-// locations only for those. Building a Vec per chunk and discarding
-// the singletons would transiently allocate several times the final
-// index size on low-dup trees.
+// Two passes: mark which keys repeat, then collect locations only for
+// those. Building a Vec per chunk and discarding the singletons would
+// transiently allocate several times the final index size on low-dup
+// trees.
 pub fn build_index(files: &[(PathBuf, Hashed)]) -> Index {
     assert!(
         u32::try_from(files.len()).is_ok(),
@@ -101,7 +106,7 @@ pub fn build_index(files: &[(PathBuf, Hashed)]) -> Index {
             if *hash == ZERO_HASH {
                 continue;
             }
-            let k = dup_key(h.stat.blksz, hash);
+            let k = dup_key(h.stat.blksz, h.stat.fsid, hash);
             if !seen.insert(k) {
                 dup.insert(k);
             }
@@ -112,13 +117,15 @@ pub fn build_index(files: &[(PathBuf, Hashed)]) -> Index {
     let mut idx = Index::default();
     for (fi, (_, h)) in files.iter().enumerate() {
         for (ci, hash) in h.hashes.iter().enumerate() {
-            if *hash == ZERO_HASH || !dup.contains(&dup_key(h.stat.blksz, hash)) {
+            if *hash == ZERO_HASH || !dup.contains(&dup_key(h.stat.blksz, h.stat.fsid, hash)) {
                 continue;
             }
-            idx.entry((h.stat.blksz, *hash)).or_default().push(Loc {
-                file: fi as u32,
-                chunk: u32::try_from(ci).expect("file too large for index"),
-            });
+            idx.entry((h.stat.blksz, h.stat.fsid, *hash))
+                .or_default()
+                .push(Loc {
+                    file: fi as u32,
+                    chunk: u32::try_from(ci).expect("file too large for index"),
+                });
         }
     }
     // Truncated-key collisions in `dup` make singletons here; drop them
@@ -272,7 +279,7 @@ pub fn dedup(files: &[(PathBuf, Hashed)], opts: Opts) -> Stats {
         .into_par_iter()
         .fold(
             || Worker::new(files, opts),
-            |mut w, ((blksz, _), locs)| {
+            |mut w, ((blksz, ..), locs)| {
                 w.group(blksz as u64, &locs);
                 w
             },
@@ -430,9 +437,24 @@ mod tests {
         files[1].1.hashes[0] = [0xbb; 16];
         files[1].1.hashes[0][8..].copy_from_slice(&[0xaa; 8]);
         assert_eq!(
-            dup_key(4096, &files[0].1.hashes[0]),
-            dup_key(4096, &files[1].1.hashes[0]),
+            dup_key(4096, 0, &files[0].1.hashes[0]),
+            dup_key(4096, 0, &files[1].1.hashes[0]),
         );
+        assert_eq!(dedup(&files, DRY).candidates, 0);
+    }
+
+    // Each ZFS dataset is its own superblock; the kernel rejects cross-
+    // superblock FIDEDUPERANGE/FICLONERANGE with EXDEV before ZFS sees
+    // it. Files on different datasets must never be candidates.
+    #[test]
+    fn cross_dataset() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = [9u8; 4096];
+        let mut files = [
+            fixture(dir.path(), "a", &data, 4096),
+            fixture(dir.path(), "b", &data, 4096),
+        ];
+        files[1].1.stat.fsid = 1;
         assert_eq!(dedup(&files, DRY).candidates, 0);
     }
 
