@@ -247,17 +247,16 @@ proceed."
     if cache.compact_if_bloated()? {
         eprintln!("compacted cache");
     }
-    // Free what dedup doesn't need; the index alone is large enough.
-    drop(cache);
     drop(seen);
 
     let stats = dedup::dedup(
         &hashed,
+        &cache,
         dedup::Opts {
             dry_run: args.dry_run,
             fideduperange,
         },
-    );
+    )?;
     let pct = if total > 0 {
         stats.bytes as f64 / total as f64 * 100.0
     } else {
