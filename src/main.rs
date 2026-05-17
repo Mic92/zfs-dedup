@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use zfs_dedup::{cache::Cache, clone, dedup, hasher, walk};
+use zfs_dedup::{cache::Cache, clone, dedup, hasher, remount, walk};
 
 const USAGE: &str = "\
 usage: zfs-dedup [-n] [-c CACHE] [-j N] [DIR...]
@@ -71,13 +71,20 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Before rayon spawns workers so they inherit the namespace. Done in
+    // dry-run too so the scan scope matches a real run; the namespace
+    // and any remounts are invisible to the host. If it fails (no
+    // CAP_SYS_ADMIN) we must not remount, or we'd alter the host.
+    let private_ns = remount::enter_private_mount_ns()
+        .inspect_err(|e| eprintln!("zfs-dedup: private mount namespace unavailable: {e:#}"))
+        .is_ok();
     if let Some(n) = args.jobs {
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build_global()
             .ok();
     }
-    match run(&args) {
+    match run(&args, private_ns) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE, // ran, but some files couldn't be processed
         Err(e) => {
@@ -115,7 +122,7 @@ fn probe_fideduperange(dirs: &BTreeSet<PathBuf>) -> bool {
     false
 }
 
-fn run(args: &Args) -> Result<bool> {
+fn run(args: &Args, private_ns: bool) -> Result<bool> {
     if let Some(parent) = args.cache.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -142,6 +149,19 @@ fn run(args: &Args) -> Result<bool> {
         let ok = walk::is_zfs(d);
         if !ok {
             eprintln!("skip {}: not a ZFS filesystem", d.display());
+        }
+        ok
+    });
+    // ro ZFS bind mounts (e.g., /nix/store on NixOS) sit over a writable
+    // dataset; remount them rw in our private namespace so they can be
+    // deduped. Truly read-only datasets stay ro and are skipped.
+    if private_ns {
+        remount::remount_rw_binds(&dirs)?;
+    }
+    dirs.retain(|d| {
+        let ok = !remount::is_ro(d);
+        if !ok {
+            eprintln!("skip {}: read-only", d.display());
         }
         ok
     });
