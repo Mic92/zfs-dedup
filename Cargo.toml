@@ -9,7 +9,7 @@ description = "Offline block-level deduplication for ZFS via FICLONERANGE"
 rustix = { version = "1", features = ["fs"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 rayon = "1"
-redb = "3"
+redb = "4"
 jwalk = "0.8"
 anyhow = "1"
 lexopt = "0.3"
