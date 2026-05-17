@@ -6,7 +6,7 @@ license = "MIT"
 description = "Offline block-level deduplication for ZFS via FICLONERANGE"
 
 [dependencies]
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "mount", "thread"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 rayon = "1"
 redb = "4"
