@@ -123,6 +123,14 @@ fn run(args: &Args) -> Result<bool> {
             dirs.insert(root); // may be a subdir, not a mountpoint
         }
     }
+    // Drop non-ZFS dirs before the FIDEDUPERANGE probe picks one.
+    dirs.retain(|d| {
+        let ok = walk::is_zfs(d);
+        if !ok {
+            eprintln!("skip {}: not a ZFS filesystem", d.display());
+        }
+        ok
+    });
     if dirs.is_empty() {
         bail!("no mounted ZFS datasets found");
     }
