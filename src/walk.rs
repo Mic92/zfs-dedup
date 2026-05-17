@@ -19,19 +19,49 @@ pub fn is_zfs(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-// Mountpoints of every mounted ZFS dataset.
-pub fn zfs_mounts() -> Result<Vec<PathBuf>> {
-    let out = Command::new("zfs")
-        .args(["list", "-H", "-t", "filesystem", "-o", "mountpoint"])
+fn zfs_cmd(cmd: &str, args: &[&str]) -> Result<String> {
+    let out = Command::new(cmd)
+        .args(args)
         .output()
-        .context("run `zfs list` (is ZFS installed and in PATH?)")?;
+        .with_context(|| format!("run `{cmd}` (is ZFS installed and in PATH?)"))?;
     if !out.status.success() {
-        bail!("zfs list failed: {}", String::from_utf8_lossy(&out.stderr));
+        bail!("{cmd} failed: {}", String::from_utf8_lossy(&out.stderr));
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+// Pools with block_cloning enabled. Without it, FICLONERANGE and
+// FIDEDUPERANGE return EOPNOTSUPP and the dataset can't be deduped.
+fn cloneable_pools() -> Result<HashSet<String>> {
+    let out = zfs_cmd(
+        "zpool",
+        &["get", "-H", "-o", "name,value", "feature@block_cloning"],
+    )?;
+    let mut pools = HashSet::new();
+    for (p, v) in out.lines().filter_map(|l| l.split_once('\t')) {
+        if matches!(v, "active" | "enabled") {
+            pools.insert(p.to_owned());
+        } else {
+            eprintln!("skip pool {p}: block_cloning feature not enabled");
+        }
+    }
+    Ok(pools)
+}
+
+// Mountpoints of every mounted ZFS dataset on a block_cloning pool.
+pub fn zfs_mounts() -> Result<Vec<PathBuf>> {
+    let pools = cloneable_pools()?;
+    let out = zfs_cmd(
+        "zfs",
+        &["list", "-H", "-t", "filesystem", "-o", "name,mountpoint"],
+    )?;
+    Ok(out
         .lines()
-        .filter(|l| l.starts_with('/'))
-        .map(PathBuf::from)
+        .filter_map(|l| l.split_once('\t'))
+        .filter(|(ds, mp)| {
+            mp.starts_with('/') && pools.contains(ds.split('/').next().unwrap_or(ds))
+        })
+        .map(|(_, mp)| PathBuf::from(mp))
         // Datasets can have a mountpoint set but not be mounted.
         .filter(|p| is_zfs(p))
         .collect())
