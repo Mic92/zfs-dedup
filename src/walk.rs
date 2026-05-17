@@ -13,7 +13,7 @@ const ZFS_SUPER_MAGIC: FsWord = 0x2fc1_2fc1;
 // We only know how to clone safely on ZFS: variable st_blksize chunking,
 // recordsize alignment, no FIDEDUPERANGE. Other reflink FSes (btrfs/xfs)
 // would technically work but with wrong assumptions; refuse them for now.
-fn is_zfs(p: &Path) -> bool {
+pub fn is_zfs(p: &Path) -> bool {
     statfs(p)
         .map(|s| s.f_type == ZFS_SUPER_MAGIC)
         .unwrap_or(false)
@@ -51,10 +51,6 @@ pub fn files<'a>(roots: impl IntoIterator<Item = &'a PathBuf>) -> Vec<(PathBuf, 
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
     let mut out = Vec::new();
     for root in roots {
-        if !is_zfs(root) {
-            eprintln!("skip {}: not a ZFS filesystem", root.display());
-            continue;
-        }
         let stat = || anyhow::Ok((std::fs::metadata(root)?.dev(), fsid(root)?));
         let (dev, fsid) = match stat() {
             Ok(v) => v,
