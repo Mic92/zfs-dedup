@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 
 use crate::cache::ChunkHash;
-use crate::clone::clone_range;
+use crate::clone::{Dedupe, clone_range, dedupe_range};
 use crate::hasher::{Hashed, ZERO_HASH};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -91,17 +91,23 @@ pub fn build_index(files: &[(PathBuf, Hashed)]) -> Index {
 // (file, chunk) since each chunk has exactly one hash.
 struct Worker<'a> {
     files: &'a [(PathBuf, Hashed)],
-    dry_run: bool,
+    opts: Opts,
     buf_a: Vec<u8>,
     buf_b: Vec<u8>,
     stats: Stats,
 }
 
+#[derive(Clone, Copy)]
+pub struct Opts {
+    pub dry_run: bool,
+    pub fideduperange: bool,
+}
+
 impl<'a> Worker<'a> {
-    fn new(files: &'a [(PathBuf, Hashed)], dry_run: bool) -> Self {
+    fn new(files: &'a [(PathBuf, Hashed)], opts: Opts) -> Self {
         Self {
             files,
-            dry_run,
+            opts,
             buf_a: Vec::new(),
             buf_b: Vec::new(),
             stats: Stats::default(),
@@ -111,7 +117,7 @@ impl<'a> Worker<'a> {
     fn open(&self, i: usize) -> Result<File> {
         File::options()
             .read(true)
-            .write(!self.dry_run)
+            .write(!self.opts.dry_run)
             .open(&self.files[i].0)
             .with_context(|| format!("open {:?}", self.files[i].0))
     }
@@ -132,12 +138,14 @@ impl<'a> Worker<'a> {
             match self.verify_and_clone(src, dst, blksz, len) {
                 Ok(true) => {
                     self.stats.verified += 1;
-                    if !self.dry_run {
+                    if !self.opts.dry_run {
                         self.stats.cloned += 1;
                     }
                     self.stats.bytes += len;
                 }
                 Ok(false) => self.stats.mismatches += 1,
+                // File vanished or shrank since we hashed it.
+                Err(e) if is_not_found(&e) => {}
                 Err(e) => {
                     eprintln!(
                         "skip {:?}+{} <- {:?}+{}: {e:#}",
@@ -152,13 +160,22 @@ impl<'a> Worker<'a> {
         }
     }
 
-    // No FIDEDUPERANGE on ZFS, so the compare/clone window is racy. We
-    // re-read here rather than trusting the (possibly stale) cache hash.
     fn verify_and_clone(&mut self, src: Loc, dst: Loc, blksz: u64, len: u64) -> Result<bool> {
         let src_off = src.chunk as u64 * blksz;
         let dst_off = dst.chunk as u64 * blksz;
         let sf = self.open(src.file)?;
         let df = self.open(dst.file)?;
+
+        if !self.opts.dry_run && self.opts.fideduperange {
+            return match dedupe_range(&sf, src_off, &df, dst_off, len).context("FIDEDUPERANGE")? {
+                Dedupe::Same => Ok(true),
+                Dedupe::Differs => Ok(false),
+                Dedupe::Unsupported => anyhow::bail!("FIDEDUPERANGE unsupported"),
+            };
+        }
+
+        // No FIDEDUPERANGE: re-read and compare in userspace, then clone.
+        // Racy against concurrent writers, hence --force.
         self.buf_a.resize(len as usize, 0);
         self.buf_b.resize(len as usize, 0);
         sf.read_exact_at(&mut self.buf_a, src_off)?;
@@ -166,20 +183,20 @@ impl<'a> Worker<'a> {
         if self.buf_a != self.buf_b {
             return Ok(false);
         }
-        if !self.dry_run {
+        if !self.opts.dry_run {
             clone_range(&sf, src_off, &df, dst_off, len).context("FICLONERANGE")?;
         }
         Ok(true)
     }
 }
 
-pub fn dedup(files: &[(PathBuf, Hashed)], dry_run: bool) -> Stats {
+pub fn dedup(files: &[(PathBuf, Hashed)], opts: Opts) -> Stats {
     let idx = build_index(files);
     let groups: Vec<_> = idx.into_iter().collect();
     groups
         .into_par_iter()
         .fold(
-            || Worker::new(files, dry_run),
+            || Worker::new(files, opts),
             |mut w, ((blksz, _), locs)| {
                 w.group(blksz as u64, &locs);
                 w
@@ -192,6 +209,18 @@ pub fn dedup(files: &[(PathBuf, Hashed)], dry_run: bool) -> Stats {
         })
 }
 
+// anyhow's downcast_ref only checks the outermost error; walk the chain.
+pub fn is_not_found(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
+            )
+        })
+    })
+}
+
 fn chunk_len(h: &Hashed, chunk: u32, blksz: u64) -> u64 {
     let off = chunk as u64 * blksz;
     (h.stat.size - off).min(blksz)
@@ -201,6 +230,11 @@ fn chunk_len(h: &Hashed, chunk: u32, blksz: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::hasher::{Stat, hash_chunk, hash_file};
+
+    const DRY: Opts = Opts {
+        dry_run: true,
+        fideduperange: false,
+    };
 
     // Build a (path, Hashed) pair with a fixed blksz, ignoring whatever
     // st_blksize the test filesystem happens to report.
@@ -222,6 +256,15 @@ mod tests {
     }
 
     #[test]
+    fn not_found_chain() {
+        let io = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let wrapped = anyhow::Error::from(io).context("open foo");
+        assert!(is_not_found(&wrapped));
+        let other = anyhow::anyhow!("unrelated");
+        assert!(!is_not_found(&other));
+    }
+
+    #[test]
     fn finds_dupes() {
         let dir = tempfile::tempdir().unwrap();
         let blk = vec![9u8; 4096];
@@ -233,7 +276,7 @@ mod tests {
             fixture(dir.path(), "a", &a, 4096),
             fixture(dir.path(), "b", &b, 4096),
         ];
-        let stats = dedup(&files, true);
+        let stats = dedup(&files, DRY);
         assert_eq!(stats.candidates, 1);
         assert_eq!(stats.verified, 1);
         assert_eq!(stats.cloned, 0);
@@ -247,7 +290,7 @@ mod tests {
             fixture(dir.path(), "a", &[1u8; 4096], 4096),
             fixture(dir.path(), "b", &[2u8; 4096], 4096),
         ];
-        assert_eq!(dedup(&files, true).candidates, 0);
+        assert_eq!(dedup(&files, DRY).candidates, 0);
     }
 
     #[test]
@@ -258,7 +301,7 @@ mod tests {
             fixture(dir.path(), "a", &z, 4096),
             fixture(dir.path(), "b", &z, 4096),
         ];
-        assert_eq!(dedup(&files, true).candidates, 0);
+        assert_eq!(dedup(&files, DRY).candidates, 0);
     }
 
     #[test]
@@ -271,6 +314,6 @@ mod tests {
         ];
         // Same bytes, same hash, different blksz: must not be a candidate.
         assert_eq!(files[0].1.hashes[0], hash_chunk(&data));
-        assert_eq!(dedup(&files, true).candidates, 0);
+        assert_eq!(dedup(&files, DRY).candidates, 0);
     }
 }

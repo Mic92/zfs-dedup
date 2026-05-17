@@ -1,16 +1,17 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::Result;
-use zfs_dedup::{cache::Cache, dedup, hasher, walk};
+use anyhow::{Context, Result, bail};
+use zfs_dedup::{cache::Cache, clone, dedup, hasher, walk};
 
 const USAGE: &str = "\
-usage: zfs-dedup [-n] [-c CACHE] [-j N] DIR...
+usage: zfs-dedup [-n] [-c CACHE] [-j N] [DIR...]
+  DIR...             directories to scan (default: all mounted ZFS datasets)
   -c, --cache PATH   hash cache (default: $XDG_CACHE_HOME/zfs-dedup/cache.redb)
   -n, --dry-run      don't modify anything
   -j, --jobs N       hashing threads (default: all cores)
-  -f, --force        scan non-ZFS filesystems too
+  -f, --force        dedup even without FIDEDUPERANGE (racy verify+clone)
   -V, --version      print version
 ";
 
@@ -58,9 +59,6 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             _ => return Err(arg.unexpected()),
         }
     }
-    if args.dirs.is_empty() {
-        return Err("no directories given".into());
-    }
     Ok(args)
 }
 
@@ -107,11 +105,44 @@ fn run(args: &Args) -> Result<bool> {
     if let Some(parent) = args.cache.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let cache = Cache::open(&args.cache)?;
+    let cache =
+        Cache::open(&args.cache).with_context(|| format!("open cache {}", args.cache.display()))?;
+
+    // Every ZFS dataset is its own mount and the walk stops at mount
+    // boundaries, so collect each dataset under the requested roots
+    // separately or child datasets get silently skipped.
+    let mounts = walk::zfs_mounts()?;
+    let mut dirs = BTreeSet::new();
+    if args.dirs.is_empty() {
+        dirs.extend(mounts);
+    } else {
+        for d in &args.dirs {
+            let root =
+                std::fs::canonicalize(d).with_context(|| format!("resolve {}", d.display()))?;
+            dirs.extend(mounts.iter().filter(|m| m.starts_with(&root)).cloned());
+            dirs.insert(root); // may be a subdir, not a mountpoint
+        }
+    }
+    if dirs.is_empty() {
+        bail!("no mounted ZFS datasets found");
+    }
+    eprintln!("scanning {} ZFS mountpoints", dirs.len());
+
+    // FIDEDUPERANGE compares and clones under inode locks; without it
+    // there's a window between our compare and the clone.
+    let fideduperange =
+        !args.dry_run && clone::probe_dedupe(dirs.first().expect("dirs non-empty"))?;
+    if !args.dry_run && !fideduperange && !args.force {
+        bail!(
+            "kernel lacks FIDEDUPERANGE; falling back to FICLONERANGE is \
+             racy against concurrent writers. Pass --force to do it anyway."
+        );
+    }
+
     // Don't dedup our own cache file if it lives under a scanned dir; redb
     // preallocates zero pages that all hash equal and shift under us.
     let cache_abs = std::fs::canonicalize(&args.cache).ok();
-    let mut paths = walk::files(&args.dirs, !args.force);
+    let mut paths = walk::files(&dirs);
     paths.retain(|p| std::fs::canonicalize(p).ok() != cache_abs);
     eprintln!("found {} files", paths.len());
 
@@ -129,6 +160,8 @@ fn run(args: &Args) -> Result<bool> {
                 }
                 hashed.push((p, h));
             }
+            // Files vanish mid-scan on a live system; not an error.
+            Err(e) if dedup::is_not_found(&e) => {}
             Err(e) => {
                 eprintln!("skip {}: {e:#}", p.display());
                 hash_errors += 1;
@@ -147,7 +180,13 @@ fn run(args: &Args) -> Result<bool> {
         eprintln!("pruned {pruned} stale cache entries");
     }
 
-    let stats = dedup::dedup(&hashed, args.dry_run);
+    let stats = dedup::dedup(
+        &hashed,
+        dedup::Opts {
+            dry_run: args.dry_run,
+            fideduperange,
+        },
+    );
     let pct = if total > 0 {
         stats.bytes as f64 / total as f64 * 100.0
     } else {

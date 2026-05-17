@@ -1,7 +1,10 @@
 use std::collections::HashSet;
+use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
+use anyhow::{Context, Result, bail};
 use rustix::fs::{FsWord, statfs};
 
 // Not in rustix's exported constants yet.
@@ -16,18 +19,33 @@ fn is_zfs(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
+// Mountpoints of every mounted ZFS dataset.
+pub fn zfs_mounts() -> Result<Vec<PathBuf>> {
+    let out = Command::new("zfs")
+        .args(["list", "-H", "-t", "filesystem", "-o", "mountpoint"])
+        .output()
+        .context("run `zfs list` (is ZFS installed and in PATH?)")?;
+    if !out.status.success() {
+        bail!("zfs list failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.starts_with('/'))
+        .map(PathBuf::from)
+        // Datasets can have a mountpoint set but not be mounted.
+        .filter(|p| is_zfs(p))
+        .collect())
+}
+
 // Collect regular files. Hardlinked sets are collapsed to one path: same
 // inode means already-shared storage, and zfs_clone_range would just hit
 // the same dnode. Symlinks not followed.
-pub fn files(roots: &[PathBuf], require_zfs: bool) -> Vec<PathBuf> {
+pub fn files<'a>(roots: impl IntoIterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
     let mut out = Vec::new();
     for root in roots {
-        if require_zfs && !is_zfs(root) {
-            eprintln!(
-                "skip {}: not a ZFS filesystem (use --force to override)",
-                root.display()
-            );
+        if !is_zfs(root) {
+            eprintln!("skip {}: not a ZFS filesystem", root.display());
             continue;
         }
         let dev = match std::fs::metadata(root) {
@@ -43,13 +61,29 @@ pub fn files(roots: &[PathBuf], require_zfs: bool) -> Vec<PathBuf> {
 }
 
 fn walk_root(root: &Path, root_dev: u64, seen: &mut HashSet<(u64, u64)>, out: &mut Vec<PathBuf>) {
+    // Prune the walk at mount boundaries; child datasets get their own
+    // walk_root call from main.
     for entry in jwalk::WalkDir::new(root)
         .skip_hidden(false)
         .follow_links(false)
         .sort(false)
+        .process_read_dir(move |_, _, _, children| {
+            for c in children.iter_mut().flatten() {
+                if c.file_type().is_dir() && c.metadata().map_or(true, |m| m.dev() != root_dev) {
+                    c.read_children_path = None;
+                }
+            }
+        })
     {
         let entry = match entry {
             Ok(e) => e,
+            // Files vanish during a live walk all the time; not an error.
+            Err(e)
+                if e.io_error()
+                    .is_some_and(|io| io.kind() == ErrorKind::NotFound) =>
+            {
+                continue;
+            }
             Err(e) => {
                 eprintln!("walk: {e}");
                 continue;
@@ -60,6 +94,12 @@ fn walk_root(root: &Path, root_dev: u64, seen: &mut HashSet<(u64, u64)>, out: &m
         }
         let meta = match entry.metadata() {
             Ok(m) => m,
+            Err(e)
+                if e.io_error()
+                    .is_some_and(|io| io.kind() == ErrorKind::NotFound) =>
+            {
+                continue;
+            }
             Err(e) => {
                 eprintln!("walk: {}: {e}", entry.path().display());
                 continue;
@@ -88,7 +128,11 @@ mod tests {
         std::fs::write(p.join("sub/c"), b"z").unwrap();
         std::os::unix::fs::symlink(p.join("a"), p.join("alink")).unwrap();
 
-        let mut got: Vec<_> = files(std::slice::from_ref(&p.to_path_buf()), false)
+        let mut seen = HashSet::new();
+        let mut got_paths = Vec::new();
+        let dev = std::fs::metadata(p).unwrap().dev();
+        super::walk_root(p, dev, &mut seen, &mut got_paths);
+        let mut got: Vec<_> = got_paths
             .into_iter()
             .map(|f| f.file_name().unwrap().to_string_lossy().into_owned())
             .collect();

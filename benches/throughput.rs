@@ -5,7 +5,6 @@ use divan::{Bencher, black_box, counter::BytesCount};
 use zfs_dedup::cache::Cache;
 use zfs_dedup::dedup::{build_index, dedup};
 use zfs_dedup::hasher::{Hashed, Stat, hash_chunk, hash_file, hash_files};
-use zfs_dedup::walk;
 
 fn main() {
     divan::main();
@@ -59,13 +58,26 @@ fn pipeline(b: Bencher, (n_files, mb_each, dup_pct): (usize, u64, u8)) {
 
 fn run_pipeline(data_dir: &Path, cache_path: &Path) -> zfs_dedup::dedup::Stats {
     let cache = Cache::open(cache_path).unwrap();
-    let paths = walk::files(std::slice::from_ref(&data_dir.to_path_buf()), false);
+    // Bench fixtures live in a tmpdir, not ZFS, so don't go through
+    // walk::files() which would refuse them. The fixture dir is flat.
+    let mut paths: Vec<_> = std::fs::read_dir(data_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_file())
+        .collect();
+    paths.sort();
     let hashed: Vec<_> = hash_files(&cache, &paths)
         .unwrap()
         .into_iter()
         .map(|(p, r)| (p, r.unwrap()))
         .collect();
-    dedup(&hashed, true)
+    dedup(
+        &hashed,
+        zfs_dedup::dedup::Opts {
+            dry_run: true,
+            fideduperange: false,
+        },
+    )
 }
 
 fn pattern(seed: u64) -> [u8; 131072] {
