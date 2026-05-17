@@ -83,7 +83,10 @@ fn walk_root(
         .sort(false)
         .process_read_dir(move |_, _, _, children| {
             for c in children.iter_mut().flatten() {
-                if c.file_type().is_dir() && c.metadata().map_or(true, |m| m.dev() != root_dev) {
+                // On stat error, descend anyway: the per-file dev check
+                // catches real boundary crossings, and pruning silently
+                // would drop the subtree from the scan.
+                if c.file_type().is_dir() && c.metadata().is_ok_and(|m| m.dev() != root_dev) {
                     c.read_children_path = None;
                 }
             }
