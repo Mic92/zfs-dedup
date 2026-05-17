@@ -9,6 +9,7 @@
 
   outputs =
     {
+      self,
       nixpkgs,
       treefmt-nix,
       ...
@@ -32,6 +33,27 @@
         };
       });
 
-      formatter = eachSystem (pkgs: import ./nix/fmt.nix { inherit pkgs treefmt-nix; });
+      formatter = eachSystem (
+        pkgs: (import ./nix/fmt.nix { inherit pkgs treefmt-nix; }).config.build.wrapper
+      );
+
+      checks = eachSystem (
+        pkgs:
+        let
+          zfs-dedup = pkgs.callPackage ./nix/package.nix { };
+          treefmt = import ./nix/fmt.nix { inherit pkgs treefmt-nix; };
+        in
+        {
+          inherit zfs-dedup;
+          clippy = zfs-dedup.overrideAttrs (old: {
+            pname = "zfs-dedup-clippy";
+            nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.clippy ];
+            buildPhase = "cargo clippy --all-targets -- -D warnings";
+            doCheck = false;
+            installPhase = "touch $out";
+          });
+          formatting = treefmt.config.build.check self;
+        }
+      );
     };
 }
