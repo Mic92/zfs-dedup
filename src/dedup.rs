@@ -151,7 +151,7 @@ pub fn build_index(files: &[(FilePath, Hashed)], cache: &Cache) -> Result<Index>
     // Upper bound; over-sizing only lowers the FP rate.
     let n_chunks: u64 = files
         .iter()
-        .map(|(_, h)| h.stat.size / u64::from(h.stat.blksz.max(1)) + 1)
+        .map(|(_, h)| h.size / u64::from(h.blksz.max(1)) + 1)
         .sum();
     let mut seen = Bloom::new(n_chunks);
     let mut dup = Pre::default();
@@ -186,12 +186,12 @@ fn each_chunk(
     mut f: impl FnMut(usize, usize, u32, u64, &ChunkHash),
 ) -> Result<()> {
     for (fi, (_, h)) in files.iter().enumerate() {
-        let Some(entry) = cache.get(h.stat.fsid, h.stat.ino)? else {
+        let Some(entry) = cache.get(h.fsid, h.ino)? else {
             continue;
         };
         for (ci, hash) in entry.hashes.iter().enumerate() {
             if *hash != ZERO_HASH {
-                f(fi, ci, h.stat.blksz, h.stat.fsid, hash);
+                f(fi, ci, h.blksz, h.fsid, hash);
             }
         }
     }
@@ -380,7 +380,7 @@ pub fn is_not_found(e: &anyhow::Error) -> bool {
 // hash read, leaving stale entries in the index. Callers skip those.
 fn chunk_len(h: &Hashed, chunk: u64, blksz: u64) -> u64 {
     let off = chunk * blksz;
-    h.stat.size.saturating_sub(off).min(blksz)
+    h.size.saturating_sub(off).min(blksz)
 }
 
 #[cfg(test)]
@@ -437,13 +437,7 @@ mod tests {
             self.cache
                 .put_many([(stat.fsid, stat.ino, stat.entry(hashes))])
                 .unwrap();
-            (
-                p,
-                Hashed {
-                    stat,
-                    from_cache: false,
-                },
-            )
+            (p, Hashed::new(&stat, false))
         }
 
         fn dedup(&self, files: impl IntoIterator<Item = (PathBuf, Hashed)>, opts: Opts) -> Stats {
@@ -538,7 +532,7 @@ mod tests {
         let data = [9u8; 8192];
         let mut files = [tx.file("a", &data, 4096, 0), tx.file("b", &data, 4096, 0)];
         for (_, h) in &mut files {
-            h.stat.size = 0;
+            h.size = 0;
         }
         assert_eq!(tx.dedup(files, DRY).verified, 0);
     }

@@ -115,14 +115,8 @@ fn index(b: Bencher, n_chunks: u32) {
     cache
         .put_many([(stat.fsid, stat.ino, stat.entry(&hashes))])
         .unwrap();
-    let files: Paths<Hashed> = [(
-        PathBuf::from("x"),
-        Hashed {
-            stat,
-            from_cache: false,
-        },
-    )]
-    .into_iter()
-    .collect();
+    let files: Paths<Hashed> = [(PathBuf::from("x"), Hashed::new(&stat, false))]
+        .into_iter()
+        .collect();
     b.bench(|| build_index(black_box(&files.files), &cache).unwrap());
 }
