@@ -164,7 +164,9 @@ fn read_full(f: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
 
 pub struct Hashed {
     pub stat: Stat,
-    pub hashes: Vec<ChunkHash>,
+    // Boxed slice: no capacity field, no over-allocation. 8 bytes/file
+    // less than Vec, plus whatever push() over-grew.
+    pub hashes: Box<[ChunkHash]>,
     pub from_cache: bool,
 }
 
@@ -223,7 +225,7 @@ fn hash_one(cache: &Cache, path: &Path, fsid: u64) -> Result<Hashed> {
     try_o_direct(&f, stat.blksz);
     Ok(Hashed {
         stat,
-        hashes: hash_fd(&f, stat.blksz)?,
+        hashes: hash_fd(&f, stat.blksz)?.into_boxed_slice(),
         from_cache: false,
     })
 }
