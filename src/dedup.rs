@@ -326,7 +326,7 @@ mod tests {
             p,
             Hashed {
                 stat,
-                hashes,
+                hashes: hashes.into_boxed_slice(),
                 from_cache: false,
             },
         )

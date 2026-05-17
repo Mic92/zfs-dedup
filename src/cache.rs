@@ -23,7 +23,7 @@ pub struct FileEntry {
     pub mtime_ns: i128,
     pub ctime_ns: i128,
     pub blksz: u32,
-    pub hashes: Vec<ChunkHash>,
+    pub hashes: Box<[ChunkHash]>,
 }
 
 // Borrowed view for encoding without cloning the hash vector.
