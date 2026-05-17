@@ -32,10 +32,19 @@ impl std::ops::AddAssign for Stats {
     }
 }
 
+// Index entries dominate working set on big trees; keep this small.
+// u32 chunk caps a single file at 4G chunks (16 TiB at 4 KiB recordsize,
+// 512 TiB at default 128 KiB); beyond that build_index asserts.
 #[derive(Clone, Copy)]
 pub struct Loc {
-    file: usize,
-    chunk: u64,
+    file: u32,
+    chunk: u32,
+}
+
+impl Loc {
+    fn off(self, blksz: u64) -> u64 {
+        self.chunk as u64 * blksz
+    }
 }
 
 // XXH3-128 keys are already uniform; SipHash on top is wasted CPU. Take
@@ -80,6 +89,10 @@ fn dup_key(blksz: u32, h: &ChunkHash) -> u64 {
 // the singletons would transiently allocate several times the final
 // index size on low-dup trees.
 pub fn build_index(files: &[(PathBuf, Hashed)]) -> Index {
+    assert!(
+        u32::try_from(files.len()).is_ok(),
+        "too many files for index"
+    );
     type Pre = HashSet<u64, BuildHasherDefault<ChunkKeyHasher>>;
     let mut seen = Pre::default();
     let mut dup = Pre::default();
@@ -103,8 +116,8 @@ pub fn build_index(files: &[(PathBuf, Hashed)]) -> Index {
                 continue;
             }
             idx.entry((h.stat.blksz, *hash)).or_default().push(Loc {
-                file: fi,
-                chunk: ci as u64,
+                file: fi as u32,
+                chunk: u32::try_from(ci).expect("file too large for index"),
             });
         }
     }
@@ -158,16 +171,16 @@ impl<'a> Worker<'a> {
         // locs[0] is the canonical source: open and read it once,
         // clone the rest from it.
         let src = locs[0];
-        let len = chunk_len(&self.files[src.file].1, src.chunk, blksz);
+        let len = chunk_len(&self.files[src.file as usize].1, src.chunk as u64, blksz);
         if len == 0 {
             return; // past stat.size: file grew after stat
         }
-        let src_off = src.chunk * blksz;
+        let src_off = src.off(blksz);
         let compare = self.opts.dry_run || !self.opts.fideduperange;
 
         // Source is read-only: dedup must work on files we can't modify.
         let prep = |w: &mut Self| -> Result<File> {
-            let sf = w.open(src.file, false)?;
+            let sf = w.open(src.file as usize, false)?;
             if compare {
                 w.buf_a.resize(len as usize, 0);
                 sf.read_exact_at(&mut w.buf_a, src_off)?;
@@ -178,14 +191,17 @@ impl<'a> Worker<'a> {
             Ok(f) => f,
             Err(e) if is_not_found(&e) => return,
             Err(e) => {
-                eprintln!("skip group {:?}+{src_off}: {e:#}", self.files[src.file].0);
+                eprintln!(
+                    "skip group {:?}+{src_off}: {e:#}",
+                    self.files[src.file as usize].0
+                );
                 self.stats.errors += 1;
                 return;
             }
         };
 
         for &dst in &locs[1..] {
-            if len != chunk_len(&self.files[dst.file].1, dst.chunk, blksz) {
+            if len != chunk_len(&self.files[dst.file as usize].1, dst.chunk as u64, blksz) {
                 continue; // tail-vs-full mismatch or stale index
             }
             self.stats.candidates += 1;
@@ -203,9 +219,9 @@ impl<'a> Worker<'a> {
                 Err(e) => {
                     eprintln!(
                         "skip {:?}+{} <- {:?}+{src_off}: {e:#}",
-                        self.files[dst.file].0,
-                        dst.chunk * blksz,
-                        self.files[src.file].0,
+                        self.files[dst.file as usize].0,
+                        dst.off(blksz),
+                        self.files[src.file as usize].0,
                     );
                     self.stats.errors += 1;
                 }
@@ -224,8 +240,8 @@ impl<'a> Worker<'a> {
         len: u64,
         compare: bool,
     ) -> Result<Option<u64>> {
-        let dst_off = dst.chunk * blksz;
-        let df = self.open(dst.file, true)?;
+        let dst_off = dst.off(blksz);
+        let df = self.open(dst.file as usize, true)?;
 
         if !compare {
             return match dedupe_range(sf, src_off, &df, dst_off, len).context("FIDEDUPERANGE")? {
