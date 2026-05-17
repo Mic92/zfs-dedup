@@ -104,7 +104,11 @@ pub struct Cache {
 
 impl Cache {
     pub fn open(path: &Path) -> Result<Self> {
-        let db = Database::create(path)?;
+        // redb's default page cache is 1 GiB; for our mostly-sequential
+        // access it just double-caches the OS page cache and dominated
+        // peak RSS in profiling. The OS page cache already keeps the
+        // file warm.
+        let db = Database::builder().set_cache_size(64 << 20).create(path)?;
         let tx = db.begin_write()?;
         tx.open_table(FILES)?;
         tx.commit()?;
