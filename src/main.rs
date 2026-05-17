@@ -220,7 +220,7 @@ proceed."
             // Files vanish mid-scan on a live system; not an error.
             Err(e) if dedup::is_not_found(&e) => {}
             Err(e) => {
-                eprintln!("skip {}: {e:#}", p.display());
+                eprintln!("skip {p}: {e:#}");
                 hash_errors += 1;
             }
         }

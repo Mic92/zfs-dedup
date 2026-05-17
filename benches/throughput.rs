@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use divan::{Bencher, black_box, counter::BytesCount};
 use zfs_dedup::cache::Cache;
@@ -64,9 +64,12 @@ fn run_pipeline(data_dir: &Path, cache_path: &Path) -> zfs_dedup::dedup::Stats {
         .unwrap()
         .map(|e| e.unwrap().path())
         .filter(|p| p.is_file())
-        .map(|p| (p, 0u64))
         .collect();
     paths.sort();
+    let paths: Vec<_> = paths
+        .into_iter()
+        .map(|p| (zfs_dedup::walk::FilePath::from_path(&p), 0u64))
+        .collect();
     let hashed: Vec<_> = hash_files(&cache, paths)
         .unwrap()
         .into_iter()
@@ -117,7 +120,7 @@ fn index(b: Bencher, n_chunks: u32) {
         .put_many([(stat.fsid, stat.ino, stat.entry(&hashes))])
         .unwrap();
     let files = vec![(
-        PathBuf::from("x"),
+        zfs_dedup::walk::FilePath::from_path(Path::new("x")),
         Hashed {
             stat,
             from_cache: false,

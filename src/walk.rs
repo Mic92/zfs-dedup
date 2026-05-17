@@ -1,11 +1,50 @@
 use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::fmt;
 use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use rustix::fs::{FsWord, statfs, statvfs};
+
+// A path split at the last component. The parent Arc is shared between
+// siblings (jwalk already keeps it that way), so for trees with many
+// files per directory the per-file footprint is the filename plus a
+// pointer instead of the full path string. Cuts the path list -- the
+// largest fixed cost on big scans -- by ~3x.
+pub struct FilePath {
+    parent: Arc<Path>,
+    name: Box<OsStr>,
+}
+
+impl FilePath {
+    pub fn to_path(&self) -> PathBuf {
+        self.parent.join(Path::new(&self.name))
+    }
+
+    // For tests and fixtures that already have a full PathBuf.
+    pub fn from_path(p: &Path) -> Self {
+        Self {
+            parent: Arc::from(p.parent().unwrap_or(Path::new(""))),
+            name: Box::from(p.file_name().unwrap_or(OsStr::new(""))),
+        }
+    }
+}
+
+impl fmt::Debug for FilePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.to_path().fmt(f)
+    }
+}
+
+impl fmt::Display for FilePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.to_path().display().fmt(f)
+    }
+}
 
 // Not in rustix's exported constants yet.
 const ZFS_SUPER_MAGIC: FsWord = 0x2fc1_2fc1;
@@ -82,7 +121,7 @@ pub fn fsid(p: &Path) -> Result<u64> {
 pub fn files<'a>(
     roots: impl IntoIterator<Item = &'a PathBuf>,
     exclude: &HashSet<(u64, u64)>,
-) -> Vec<(PathBuf, u64)> {
+) -> Vec<(FilePath, u64)> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for root in roots {
@@ -109,7 +148,7 @@ fn walk_root(
     fsid: u64,
     exclude: &HashSet<(u64, u64)>,
     seen: &mut HashSet<(u64, u64)>,
-    out: &mut Vec<(PathBuf, u64)>,
+    out: &mut Vec<(FilePath, u64)>,
 ) {
     // process_read_dir runs on rayon threads: stat there so the per-file
     // syscall is parallel. The for loop below is single-threaded and
@@ -179,7 +218,13 @@ fn walk_root(
         if nlink > 1 && !seen.insert((dev, ino)) {
             continue;
         }
-        out.push((entry.path(), fsid));
+        out.push((
+            FilePath {
+                parent: entry.parent_path.clone(),
+                name: entry.file_name.clone().into_boxed_os_str(),
+            },
+            fsid,
+        ));
     }
 }
 
@@ -204,7 +249,7 @@ mod tests {
             let mut out = Vec::new();
             super::walk_root(p, dev, 0, excl, &mut seen, &mut out);
             out.into_iter()
-                .map(|(f, _)| f.file_name().unwrap().to_string_lossy().into_owned())
+                .map(|(f, _)| f.name.to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
         };
 

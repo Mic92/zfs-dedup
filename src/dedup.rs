@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
-use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -10,6 +9,7 @@ use rayon::prelude::*;
 use crate::cache::{Cache, ChunkHash};
 use crate::clone::{Dedupe, clone_range, dedupe_range};
 use crate::hasher::{Hashed, NOFOLLOW_NONBLOCK, ZERO_HASH};
+use crate::walk::FilePath;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
@@ -141,7 +141,7 @@ impl Bloom {
 // they were just written there during hashing, so the reads are all
 // page-cache hits. This bounds the working set by the index, not by
 // total chunk count.
-pub fn build_index(files: &[(PathBuf, Hashed)], cache: &Cache) -> Result<Index> {
+pub fn build_index(files: &[(FilePath, Hashed)], cache: &Cache) -> Result<Index> {
     assert!(
         u32::try_from(files.len()).is_ok(),
         "too many files for index"
@@ -180,7 +180,7 @@ pub fn build_index(files: &[(PathBuf, Hashed)], cache: &Cache) -> Result<Index> 
 
 // Visit every non-zero chunk of every file, fetching hashes from cache.
 fn each_chunk(
-    files: &[(PathBuf, Hashed)],
+    files: &[(FilePath, Hashed)],
     cache: &Cache,
     mut f: impl FnMut(usize, usize, u32, u64, &ChunkHash),
 ) -> Result<()> {
@@ -204,7 +204,7 @@ fn each_chunk(
 // concurrently, which ZFS handles fine. Groups never share a
 // (file, chunk) since each chunk has exactly one hash.
 struct Worker<'a> {
-    files: &'a [(PathBuf, Hashed)],
+    files: &'a [(FilePath, Hashed)],
     opts: Opts,
     buf_a: Vec<u8>,
     buf_b: Vec<u8>,
@@ -218,7 +218,7 @@ pub struct Opts {
 }
 
 impl<'a> Worker<'a> {
-    fn new(files: &'a [(PathBuf, Hashed)], opts: Opts) -> Self {
+    fn new(files: &'a [(FilePath, Hashed)], opts: Opts) -> Self {
         Self {
             files,
             opts,
@@ -229,12 +229,13 @@ impl<'a> Worker<'a> {
     }
 
     fn open(&self, i: usize, write: bool) -> Result<File> {
+        let p = self.files[i].0.to_path();
         File::options()
             .read(true)
             .write(write && !self.opts.dry_run)
             .custom_flags(NOFOLLOW_NONBLOCK)
-            .open(&self.files[i].0)
-            .with_context(|| format!("open {:?}", self.files[i].0))
+            .open(&p)
+            .with_context(|| format!("open {p:?}"))
     }
 
     fn group(&mut self, blksz: u64, locs: &[Loc]) {
@@ -335,7 +336,7 @@ impl<'a> Worker<'a> {
     }
 }
 
-pub fn dedup(files: &[(PathBuf, Hashed)], cache: &Cache, opts: Opts) -> Result<Stats> {
+pub fn dedup(files: &[(FilePath, Hashed)], cache: &Cache, opts: Opts) -> Result<Stats> {
     let idx = build_index(files, cache)?;
     let groups: Vec<_> = idx.into_iter().collect();
     Ok(groups
@@ -398,7 +399,7 @@ mod tests {
 
         // Real file with a fixed blksz, ignoring whatever st_blksize
         // the test filesystem happens to report.
-        fn file(&self, name: &str, data: &[u8], blksz: u32, fsid: u64) -> (PathBuf, Hashed) {
+        fn file(&self, name: &str, data: &[u8], blksz: u32, fsid: u64) -> (FilePath, Hashed) {
             let hashes = {
                 let p = self.dir.path().join(name);
                 std::fs::write(&p, data).unwrap();
@@ -415,7 +416,7 @@ mod tests {
             blksz: u32,
             fsid: u64,
             hashes: &[ChunkHash],
-        ) -> (PathBuf, Hashed) {
+        ) -> (FilePath, Hashed) {
             let p = self.dir.path().join(name);
             if !p.exists() {
                 std::fs::write(&p, vec![0u8; size as usize]).unwrap();
@@ -428,7 +429,7 @@ mod tests {
                 .put_many([(stat.fsid, stat.ino, stat.entry(hashes))])
                 .unwrap();
             (
-                p,
+                FilePath::from_path(&p),
                 Hashed {
                     stat,
                     from_cache: false,
@@ -436,7 +437,7 @@ mod tests {
             )
         }
 
-        fn dedup(&self, files: &[(PathBuf, Hashed)], opts: Opts) -> Stats {
+        fn dedup(&self, files: &[(FilePath, Hashed)], opts: Opts) -> Stats {
             dedup(files, &self.cache, opts).unwrap()
         }
     }
@@ -508,7 +509,8 @@ mod tests {
         let tx = Tx::new();
         let data = [9u8; 4096];
         let files = [tx.file("ro", &data, 4096, 0), tx.file("rw", &data, 4096, 0)];
-        std::fs::set_permissions(&files[0].0, std::fs::Permissions::from_mode(0o400)).unwrap();
+        std::fs::set_permissions(files[0].0.to_path(), std::fs::Permissions::from_mode(0o400))
+            .unwrap();
         let opts = Opts {
             dry_run: false,
             fideduperange: false,
