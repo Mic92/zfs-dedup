@@ -20,8 +20,18 @@ saved 79.0 GiB (9.0%) across 3860361 blocks, 0 mismatches, 0 errors
 nix run github:Mic92/zfs-dedup
 ```
 
-or `cargo build --release`. Needs a ZFS pool with the `block_cloning`
-feature enabled and Linux.
+or `cargo build --release`.
+
+## Requirements
+
+- Linux
+- OpenZFS **2.2.0+** with the `block_cloning` pool feature enabled
+  (`zpool upgrade` or `zpool set feature@block_cloning=enabled`)
+- OpenZFS **2.3.0+** recommended: hash reads use `O_DIRECT` to avoid
+  evicting your hot ARC during a cold scan. Older ZFS silently falls
+  back to buffered reads.
+- `FIDEDUPERANGE` for in-kernel verify+clone needs a patched ZFS;
+  stock ZFS requires `--force` for the userspace verify path.
 
 ## Usage
 
