@@ -51,7 +51,7 @@ const FILE_DEDUPE_RANGE_DIFFERS: i32 = 1;
 struct Fideduperange(DedupeOne);
 
 unsafe impl Ioctl for Fideduperange {
-    type Output = i32;
+    type Output = (i32, u64); // (status, bytes_deduped)
     const IS_MUTATING: bool = true;
 
     fn opcode(&self) -> Opcode {
@@ -63,13 +63,15 @@ unsafe impl Ioctl for Fideduperange {
     }
 
     unsafe fn output_from_ptr(_out: IoctlOutput, ptr: *mut c_void) -> io::Result<Self::Output> {
-        Ok(unsafe { (*ptr.cast::<DedupeOne>()).info.status })
+        let info = unsafe { &(*ptr.cast::<DedupeOne>()).info };
+        Ok((info.status, info.bytes_deduped))
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Dedupe {
-    Same,
+    // Bytes actually deduped; the kernel may do less than requested.
+    Same(u64),
     Differs,
     Unsupported,
 }
@@ -100,12 +102,12 @@ pub fn dedupe_range(
     };
     // The kernel reports per-target errors via info.status, not the
     // ioctl return.
-    let status = match unsafe { ioctl(&src, Fideduperange(arg)) } {
+    let (status, bytes) = match unsafe { ioctl(&src, Fideduperange(arg)) } {
         Ok(s) => s,
-        Err(e) => -e.raw_os_error(),
+        Err(e) => (-e.raw_os_error(), 0),
     };
     match status {
-        0 => Ok(Dedupe::Same),
+        0 => Ok(Dedupe::Same(bytes)),
         FILE_DEDUPE_RANGE_DIFFERS => Ok(Dedupe::Differs),
         _ => match io::Errno::from_raw_os_error(-status) {
             io::Errno::NOTTY | io::Errno::OPNOTSUPP | io::Errno::NOSYS => Ok(Dedupe::Unsupported),
