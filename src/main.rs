@@ -211,7 +211,7 @@ proceed."
     let mut hash_errors = 0usize;
     let hashed = results.filter_map(|p, r, arena| match r {
         Ok(h) => {
-            seen.insert((h.stat.fsid, h.stat.ino));
+            seen.insert((h.fsid, h.ino));
             if h.from_cache {
                 hits += 1;
             }
@@ -225,7 +225,7 @@ proceed."
             None
         }
     });
-    let total: u64 = hashed.files.iter().map(|(_, h)| h.stat.size).sum();
+    let total: u64 = hashed.files.iter().map(|(_, h)| h.size).sum();
     eprintln!(
         "hashed {} files ({hits} from cache), {} total",
         hashed.files.len(),

@@ -174,16 +174,32 @@ fn read_full(f: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(off)
 }
 
-// No hashes here: they live in the cache only. Holding them per-file
-// dominated RSS on big trees, and the index is the only consumer.
+// Per-file state held through the dedup phase. No hashes (they live
+// only in the cache) and no timestamps (only used to validate the
+// cache during hash_one). 32 bytes; Stat is 64.
 pub struct Hashed {
-    pub stat: Stat,
+    pub fsid: u64,
+    pub ino: u64,
+    pub size: u64,
+    pub blksz: u32,
     pub from_cache: bool,
 }
 
+impl Hashed {
+    pub fn new(stat: &Stat, from_cache: bool) -> Self {
+        Self {
+            fsid: stat.fsid,
+            ino: stat.ino,
+            size: stat.size,
+            blksz: stat.blksz,
+            from_cache,
+        }
+    }
+}
+
 // Hash and persist `paths`; the returned set carries no hashes.
-// Process in batches so the per-file hash vectors are short-lived
-// instead of accumulating until the end.
+// Process in batches so the per-file hash vectors and Stat (with
+// timestamps) are short-lived instead of accumulating until the end.
 pub fn hash_files(cache: &Cache, paths: Paths<u64>) -> Result<Paths<Result<Hashed>>> {
     paths.map_batched(100_000, |arena, batch| {
         let results: Vec<_> = batch
@@ -194,19 +210,17 @@ pub fn hash_files(cache: &Cache, paths: Paths<u64>) -> Result<Paths<Result<Hashe
             })
             .collect();
         cache.put_many(results.iter().filter_map(|(_, r)| match r {
-            Ok((h, hashes)) if !h.from_cache => {
-                Some((h.stat.fsid, h.stat.ino, h.stat.entry(hashes)))
-            }
+            Ok((s, false, hashes)) => Some((s.fsid, s.ino, s.entry(hashes))),
             _ => None,
         }))?;
         Ok(results
             .into_iter()
-            .map(|(p, r)| (p, r.map(|(h, _)| h)))
+            .map(|(p, r)| (p, r.map(|(s, fc, _)| Hashed::new(&s, fc))))
             .collect())
     })
 }
 
-fn hash_one(cache: &Cache, path: &Path, fsid: u64) -> Result<(Hashed, Box<[ChunkHash]>)> {
+fn hash_one(cache: &Cache, path: &Path, fsid: u64) -> Result<(Stat, bool, Box<[ChunkHash]>)> {
     let f = open_nofollow(path).with_context(|| format!("open {path:?}"))?;
     let meta = f.metadata()?;
     ensure!(meta.is_file(), "not a regular file: {path:?}");
@@ -215,23 +229,12 @@ fn hash_one(cache: &Cache, path: &Path, fsid: u64) -> Result<(Hashed, Box<[Chunk
     if let Some(entry) = cache.get(stat.fsid, stat.ino)?
         && entry.matches(stat.size, stat.mtime_ns, stat.ctime_ns, stat.blksz)
     {
-        return Ok((
-            Hashed {
-                stat,
-                from_cache: true,
-            },
-            entry.hashes,
-        ));
+        return Ok((stat, true, entry.hashes));
     }
 
     try_o_direct(&f, stat.blksz);
-    Ok((
-        Hashed {
-            stat,
-            from_cache: false,
-        },
-        hash_fd(&f, stat.blksz)?.into_boxed_slice(),
-    ))
+    let hashes = hash_fd(&f, stat.blksz)?.into_boxed_slice();
+    Ok((stat, false, hashes))
 }
 
 #[cfg(test)]
@@ -314,15 +317,15 @@ mod tests {
                 .1
                 .unwrap()
         };
-        let cached = |s: &Stat| cache.get(s.fsid, s.ino).unwrap().unwrap().hashes;
+        let cached = |h: &Hashed| cache.get(h.fsid, h.ino).unwrap().unwrap().hashes;
 
         let a = one(ps());
         assert!(!a.from_cache);
-        let ha = cached(&a.stat);
+        let ha = cached(&a);
 
         let b = one(ps());
         assert!(b.from_cache);
-        assert_eq!(ha, cached(&b.stat));
+        assert_eq!(ha, cached(&b));
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         std::fs::OpenOptions::new()
@@ -334,6 +337,6 @@ mod tests {
 
         let c = one(ps());
         assert!(!c.from_cache);
-        assert_ne!(ha, cached(&c.stat));
+        assert_ne!(ha, cached(&c));
     }
 }
