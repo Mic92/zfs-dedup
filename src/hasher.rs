@@ -1,10 +1,11 @@
 use std::fs::File;
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use rayon::prelude::*;
+use rustix::fs::OFlags;
 
 use crate::cache::{Cache, ChunkHash, EntryRef, HASH_LEN};
 
@@ -37,14 +38,30 @@ impl Stat {
     }
 }
 
+// The walk only emits regular files, but a path can be swapped for a
+// symlink or fifo before we open it. NOFOLLOW + NONBLOCK + an fstat on
+// the fd close the stat-then-open window. Used by hasher and dedup.
+pub const NOFOLLOW_NONBLOCK: i32 = OFlags::NOFOLLOW.union(OFlags::NONBLOCK).bits() as i32;
+
+fn open_nofollow(path: &Path) -> std::io::Result<File> {
+    File::options()
+        .read(true)
+        .custom_flags(NOFOLLOW_NONBLOCK)
+        .open(path)
+}
+
 // Chunk boundaries follow st_blksize so the hashes line up with ranges
 // FICLONERANGE will accept. XXH3-128 is non-crypto; we always byte-verify
 // candidate pairs before cloning, so the hash only has to keep the false-
 // positive rate low. Cross-file parallelism comes from rayon at the call
 // site.
 pub fn hash_file(path: &Path, blksz: u32) -> Result<Vec<ChunkHash>> {
+    let f = open_nofollow(path).with_context(|| format!("open {path:?}"))?;
+    hash_fd(&f, blksz)
+}
+
+fn hash_fd(mut f: impl Read, blksz: u32) -> Result<Vec<ChunkHash>> {
     ensure!(blksz > 0, "blksz must be > 0");
-    let mut f = File::open(path).with_context(|| format!("open {path:?}"))?;
     let mut buf = vec![0u8; blksz as usize];
     let mut hashes = Vec::new();
     loop {
@@ -85,7 +102,7 @@ fn is_zero(buf: &[u8]) -> bool {
     true
 }
 
-fn read_full(f: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
+fn read_full(f: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut off = 0;
     while off < buf.len() {
         let n = f.read(&mut buf[off..])?;
@@ -135,7 +152,8 @@ pub fn hash_files(
 }
 
 fn hash_one(cache: &Cache, path: &Path, fsid: u64) -> Result<Hashed> {
-    let meta = std::fs::symlink_metadata(path).with_context(|| format!("stat {path:?}"))?;
+    let f = open_nofollow(path).with_context(|| format!("open {path:?}"))?;
+    let meta = f.metadata()?;
     ensure!(meta.is_file(), "not a regular file: {path:?}");
     let stat = Stat::from_metadata(&meta, fsid);
 
@@ -151,7 +169,7 @@ fn hash_one(cache: &Cache, path: &Path, fsid: u64) -> Result<Hashed> {
 
     Ok(Hashed {
         stat,
-        hashes: hash_file(path, stat.blksz)?,
+        hashes: hash_fd(&f, stat.blksz)?,
         from_cache: false,
     })
 }
@@ -189,6 +207,16 @@ mod tests {
         assert!(is_zero(&[0; 4096]));
         assert!(!is_zero(&[0, 0, 0, 1]));
         assert!(!is_zero(&[1, 0, 0, 0]));
+    }
+
+    #[test]
+    fn rejects_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        std::fs::write(&target, b"data").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(hash_file(&link, 4096).is_err(), "followed symlink");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -9,7 +9,7 @@ use rayon::prelude::*;
 
 use crate::cache::ChunkHash;
 use crate::clone::{Dedupe, clone_range, dedupe_range};
-use crate::hasher::{Hashed, ZERO_HASH};
+use crate::hasher::{Hashed, NOFOLLOW_NONBLOCK, ZERO_HASH};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
@@ -118,6 +118,7 @@ impl<'a> Worker<'a> {
         File::options()
             .read(true)
             .write(write && !self.opts.dry_run)
+            .custom_flags(NOFOLLOW_NONBLOCK)
             .open(&self.files[i].0)
             .with_context(|| format!("open {:?}", self.files[i].0))
     }
