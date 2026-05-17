@@ -114,7 +114,7 @@ fn run(args: &Args) -> Result<bool> {
     let mounts = walk::zfs_mounts()?;
     let mut dirs = BTreeSet::new();
     if args.dirs.is_empty() {
-        dirs.extend(mounts);
+        dirs.extend(mounts.iter().cloned());
     } else {
         for d in &args.dirs {
             let root =
@@ -143,7 +143,7 @@ fn run(args: &Args) -> Result<bool> {
     // preallocates zero pages that all hash equal and shift under us.
     let cache_abs = std::fs::canonicalize(&args.cache).ok();
     let mut paths = walk::files(&dirs);
-    paths.retain(|p| std::fs::canonicalize(p).ok() != cache_abs);
+    paths.retain(|(p, _)| std::fs::canonicalize(p).ok() != cache_abs);
     eprintln!("found {} files", paths.len());
 
     let results = hasher::hash_files(&cache, &paths)?;
@@ -154,7 +154,7 @@ fn run(args: &Args) -> Result<bool> {
     for (p, r) in results {
         match r {
             Ok(h) => {
-                seen.insert((h.stat.dev, h.stat.ino));
+                seen.insert((h.stat.fsid, h.stat.ino));
                 if h.from_cache {
                     hits += 1;
                 }
@@ -175,7 +175,14 @@ fn run(args: &Args) -> Result<bool> {
         human(total)
     );
 
-    let pruned = cache.prune(&seen)?;
+    // Only prune datasets we scanned in full; a subdir scan covers part
+    // of a dataset and must not evict siblings it never visited.
+    let scanned_fsids: HashSet<u64> = dirs
+        .iter()
+        .filter(|d| mounts.contains(d))
+        .filter_map(|d| walk::fsid(d).ok())
+        .collect();
+    let pruned = cache.prune(&seen, &scanned_fsids)?;
     if pruned > 0 {
         eprintln!("pruned {pruned} stale cache entries");
     }

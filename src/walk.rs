@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use rustix::fs::{FsWord, statfs};
+use rustix::fs::{FsWord, statfs, statvfs};
 
 // Not in rustix's exported constants yet.
 const ZFS_SUPER_MAGIC: FsWord = 0x2fc1_2fc1;
@@ -37,10 +37,17 @@ pub fn zfs_mounts() -> Result<Vec<PathBuf>> {
         .collect())
 }
 
-// Collect regular files. Hardlinked sets are collapsed to one path: same
-// inode means already-shared storage, and zfs_clone_range would just hit
-// the same dnode. Symlinks not followed.
-pub fn files<'a>(roots: impl IntoIterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
+// Per-dataset filesystem id from statvfs. ZFS derives this from the
+// dataset's persistent fsid_guid, so unlike st_dev it is stable across
+// reboots, remounts, and pool import order.
+pub fn fsid(p: &Path) -> Result<u64> {
+    Ok(statvfs(p)?.f_fsid)
+}
+
+// Collect regular files tagged with their dataset fsid. Hardlinked sets
+// are collapsed to one path: same inode means already-shared storage, and
+// zfs_clone_range would just hit the same dnode. Symlinks not followed.
+pub fn files<'a>(roots: impl IntoIterator<Item = &'a PathBuf>) -> Vec<(PathBuf, u64)> {
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
     let mut out = Vec::new();
     for root in roots {
@@ -48,19 +55,26 @@ pub fn files<'a>(roots: impl IntoIterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
             eprintln!("skip {}: not a ZFS filesystem", root.display());
             continue;
         }
-        let dev = match std::fs::metadata(root) {
-            Ok(m) => m.dev(),
+        let stat = || anyhow::Ok((std::fs::metadata(root)?.dev(), fsid(root)?));
+        let (dev, fsid) = match stat() {
+            Ok(v) => v,
             Err(e) => {
                 eprintln!("walk: {}: {e}", root.display());
                 continue;
             }
         };
-        walk_root(root, dev, &mut seen, &mut out);
+        walk_root(root, dev, fsid, &mut seen, &mut out);
     }
     out
 }
 
-fn walk_root(root: &Path, root_dev: u64, seen: &mut HashSet<(u64, u64)>, out: &mut Vec<PathBuf>) {
+fn walk_root(
+    root: &Path,
+    root_dev: u64,
+    fsid: u64,
+    seen: &mut HashSet<(u64, u64)>,
+    out: &mut Vec<(PathBuf, u64)>,
+) {
     // Prune the walk at mount boundaries; child datasets get their own
     // walk_root call from main.
     for entry in jwalk::WalkDir::new(root)
@@ -108,7 +122,7 @@ fn walk_root(root: &Path, root_dev: u64, seen: &mut HashSet<(u64, u64)>, out: &m
         // Stay on the root filesystem; a different dev means we crossed
         // a mount point, which could be non-ZFS or a different pool.
         if meta.dev() == root_dev && seen.insert((meta.dev(), meta.ino())) {
-            out.push(entry.path());
+            out.push((entry.path(), fsid));
         }
     }
 }
@@ -131,10 +145,10 @@ mod tests {
         let mut seen = HashSet::new();
         let mut got_paths = Vec::new();
         let dev = std::fs::metadata(p).unwrap().dev();
-        super::walk_root(p, dev, &mut seen, &mut got_paths);
+        super::walk_root(p, dev, 0, &mut seen, &mut got_paths);
         let mut got: Vec<_> = got_paths
             .into_iter()
-            .map(|f| f.file_name().unwrap().to_string_lossy().into_owned())
+            .map(|(f, _)| f.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         got.sort();
         // a/a2 collapse to one (whichever jwalk hits first), plus b and sub/c.

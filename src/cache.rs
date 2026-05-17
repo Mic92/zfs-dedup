@@ -9,7 +9,8 @@ pub type ChunkHash = [u8; HASH_LEN];
 
 const FILES: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("files");
 
-// Keyed on (dev, ino). Entry is stale if any of size/mtime/ctime/blksz
+// Keyed on (fsid, ino); see walk::fsid for why not st_dev.
+// Entry is stale if any of size/mtime/ctime/blksz
 // changed. Hashes are in offset order, chunk i covers [i*blksz, (i+1)*blksz).
 //
 // Note: ZFS reports st_blksize == the file's actual on-disk blocksize, which
@@ -99,17 +100,17 @@ impl Cache {
         Ok(Self { db })
     }
 
-    pub fn get(&self, dev: u64, ino: u64) -> Result<Option<FileEntry>> {
+    pub fn get(&self, fsid: u64, ino: u64) -> Result<Option<FileEntry>> {
         let tx = self.db.begin_read()?;
         let table = tx.open_table(FILES)?;
-        match table.get((dev, ino))? {
+        match table.get((fsid, ino))? {
             Some(v) => Ok(Some(FileEntry::decode(v.value())?)),
             None => Ok(None),
         }
     }
 
-    pub fn put(&self, dev: u64, ino: u64, entry: EntryRef) -> Result<()> {
-        self.put_many([(dev, ino, entry)])
+    pub fn put(&self, fsid: u64, ino: u64, entry: EntryRef) -> Result<()> {
+        self.put_many([(fsid, ino, entry)])
     }
 
     pub fn put_many<'a>(
@@ -119,17 +120,17 @@ impl Cache {
         let tx = self.db.begin_write()?;
         {
             let mut table = tx.open_table(FILES)?;
-            for (dev, ino, e) in entries {
-                table.insert((dev, ino), encode(e).as_slice())?;
+            for (fsid, ino, e) in entries {
+                table.insert((fsid, ino), encode(e).as_slice())?;
             }
         }
         tx.commit()?;
         Ok(())
     }
 
-    // Drop entries whose keys weren't seen this run. Keeps the DB from
-    // growing forever as files get deleted or renamed across runs.
-    pub fn prune(&self, seen: &HashSet<(u64, u64)>) -> Result<usize> {
+    // Drop unseen entries on datasets we scanned. Scoping to `fsids`
+    // keeps a partial scan from evicting cache for trees it never visited.
+    pub fn prune(&self, seen: &HashSet<(u64, u64)>, fsids: &HashSet<u64>) -> Result<usize> {
         let tx = self.db.begin_write()?;
         let removed;
         {
@@ -138,7 +139,7 @@ impl Cache {
                 .iter()?
                 .filter_map(|r| r.ok())
                 .map(|(k, _)| k.value())
-                .filter(|k| !seen.contains(k))
+                .filter(|k| fsids.contains(&k.0) && !seen.contains(k))
                 .collect();
             removed = stale.len();
             for k in stale {
@@ -221,11 +222,24 @@ mod tests {
             cache.put(0, i, e.as_ref()).unwrap();
         }
         let seen: HashSet<_> = [(0, 1), (0, 3)].into();
-        assert_eq!(cache.prune(&seen).unwrap(), 3);
+        assert_eq!(cache.prune(&seen, &[0].into()).unwrap(), 3);
         assert!(cache.get(0, 0).unwrap().is_none());
         assert!(cache.get(0, 1).unwrap().is_some());
         assert!(cache.get(0, 2).unwrap().is_none());
         assert!(cache.get(0, 3).unwrap().is_some());
         assert!(cache.get(0, 4).unwrap().is_none());
+    }
+
+    #[test]
+    fn prune_scoped_to_scanned_fsids() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(&dir.path().join("c.redb")).unwrap();
+        let e = entry(1);
+        cache.put(1, 0, e.as_ref()).unwrap();
+        cache.put(2, 0, e.as_ref()).unwrap();
+        // Scanned fsid 1, saw nothing: prune fsid 1 only, fsid 2 untouched.
+        assert_eq!(cache.prune(&HashSet::new(), &[1].into()).unwrap(), 1);
+        assert!(cache.get(1, 0).unwrap().is_none());
+        assert!(cache.get(2, 0).unwrap().is_some());
     }
 }

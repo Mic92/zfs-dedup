@@ -246,7 +246,7 @@ mod tests {
         let p = dir.join(name);
         std::fs::write(&p, data).unwrap();
         let m = std::fs::metadata(&p).unwrap();
-        let mut stat = Stat::from_metadata(&m);
+        let mut stat = Stat::from_metadata(&m, 0);
         stat.blksz = blksz;
         let hashes = hash_file(&p, blksz).unwrap();
         (
