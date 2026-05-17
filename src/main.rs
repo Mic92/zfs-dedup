@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashSet};
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -149,9 +150,11 @@ fn run(args: &Args) -> Result<bool> {
 
     // Don't dedup our own cache file if it lives under a scanned dir; redb
     // preallocates zero pages that all hash equal and shift under us.
-    let cache_abs = std::fs::canonicalize(&args.cache).ok();
-    let mut paths = walk::files(&dirs);
-    paths.retain(|(p, _)| std::fs::canonicalize(p).ok() != cache_abs);
+    let exclude: HashSet<_> = std::fs::metadata(&args.cache)
+        .map(|m| (m.dev(), m.ino()))
+        .into_iter()
+        .collect();
+    let paths = walk::files(&dirs, &exclude);
     eprintln!("found {} files", paths.len());
 
     let results = hasher::hash_files(&cache, &paths)?;
