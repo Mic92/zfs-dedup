@@ -1,10 +1,11 @@
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use divan::{Bencher, black_box, counter::BytesCount};
 use zfs_dedup::cache::Cache;
 use zfs_dedup::dedup::{build_index, dedup};
 use zfs_dedup::hasher::{Hashed, Stat, hash_chunk, hash_file, hash_files};
+use zfs_dedup::walk::Paths;
 
 fn main() {
     divan::main();
@@ -66,15 +67,10 @@ fn run_pipeline(data_dir: &Path, cache_path: &Path) -> zfs_dedup::dedup::Stats {
         .filter(|p| p.is_file())
         .collect();
     paths.sort();
-    let paths: Vec<_> = paths
-        .into_iter()
-        .map(|p| (zfs_dedup::walk::FilePath::from_path(&p), 0u64))
-        .collect();
-    let hashed: Vec<_> = hash_files(&cache, paths)
+    let paths: Paths<u64> = paths.into_iter().map(|p| (p, 0u64)).collect();
+    let hashed = hash_files(&cache, paths)
         .unwrap()
-        .into_iter()
-        .map(|(p, r)| (p, r.unwrap()))
-        .collect();
+        .filter_map(|_, r, _| Some(r.unwrap()));
     dedup(
         &hashed,
         &cache,
@@ -119,12 +115,14 @@ fn index(b: Bencher, n_chunks: u32) {
     cache
         .put_many([(stat.fsid, stat.ino, stat.entry(&hashes))])
         .unwrap();
-    let files = vec![(
-        zfs_dedup::walk::FilePath::from_path(Path::new("x")),
+    let files: Paths<Hashed> = [(
+        PathBuf::from("x"),
         Hashed {
             stat,
             from_cache: false,
         },
-    )];
-    b.bench(|| build_index(black_box(&files), &cache).unwrap());
+    )]
+    .into_iter()
+    .collect();
+    b.bench(|| build_index(black_box(&files.files), &cache).unwrap());
 }
