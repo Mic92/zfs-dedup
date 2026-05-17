@@ -35,7 +35,7 @@ impl std::ops::AddAssign for Stats {
 #[derive(Clone, Copy)]
 pub struct Loc {
     file: usize,
-    chunk: u32,
+    chunk: u64,
 }
 
 // XXH3-128 keys are already uniform; SipHash on top is wasted CPU. Take
@@ -75,7 +75,7 @@ pub fn build_index(files: &[(PathBuf, Hashed)]) -> Index {
             }
             idx.entry((h.stat.blksz, *hash)).or_default().push(Loc {
                 file: fi,
-                chunk: ci as u32,
+                chunk: ci as u64,
             });
         }
     }
@@ -152,9 +152,9 @@ impl<'a> Worker<'a> {
                     eprintln!(
                         "skip {:?}+{} <- {:?}+{}: {e:#}",
                         self.files[dst.file].0,
-                        dst.chunk as u64 * blksz,
+                        dst.chunk * blksz,
                         self.files[src.file].0,
-                        src.chunk as u64 * blksz,
+                        src.chunk * blksz,
                     );
                     self.stats.errors += 1;
                 }
@@ -163,8 +163,8 @@ impl<'a> Worker<'a> {
     }
 
     fn verify_and_clone(&mut self, src: Loc, dst: Loc, blksz: u64, len: u64) -> Result<bool> {
-        let src_off = src.chunk as u64 * blksz;
-        let dst_off = dst.chunk as u64 * blksz;
+        let src_off = src.chunk * blksz;
+        let dst_off = dst.chunk * blksz;
         // Source is read-only: dedup must work on files we can't modify.
         let sf = self.open(src.file, false)?;
         let df = self.open(dst.file, true)?;
@@ -226,8 +226,8 @@ pub fn is_not_found(e: &anyhow::Error) -> bool {
 
 // 0 if `chunk` is past stat.size: file grew between stat() and the
 // hash read, leaving stale entries in the index. Callers skip those.
-fn chunk_len(h: &Hashed, chunk: u32, blksz: u64) -> u64 {
-    let off = chunk as u64 * blksz;
+fn chunk_len(h: &Hashed, chunk: u64, blksz: u64) -> u64 {
+    let off = chunk * blksz;
     h.stat.size.saturating_sub(off).min(blksz)
 }
 
