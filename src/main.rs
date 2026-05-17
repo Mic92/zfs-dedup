@@ -201,34 +201,32 @@ proceed."
         .into_iter()
         .collect();
     let paths = walk::files(&dirs, &exclude);
-    eprintln!("found {} files", paths.len());
+    eprintln!("found {} files", paths.files.len());
 
     let results = hasher::hash_files(&cache, paths)?;
-    let mut hashed = Vec::with_capacity(results.len());
     let mut seen = HashSet::new();
     let mut hits = 0usize;
     let mut hash_errors = 0usize;
-    for (p, r) in results {
-        match r {
-            Ok(h) => {
-                seen.insert((h.stat.fsid, h.stat.ino));
-                if h.from_cache {
-                    hits += 1;
-                }
-                hashed.push((p, h));
+    let hashed = results.filter_map(|p, r, arena| match r {
+        Ok(h) => {
+            seen.insert((h.stat.fsid, h.stat.ino));
+            if h.from_cache {
+                hits += 1;
             }
-            // Files vanish mid-scan on a live system; not an error.
-            Err(e) if dedup::is_not_found(&e) => {}
-            Err(e) => {
-                eprintln!("skip {p}: {e:#}");
-                hash_errors += 1;
-            }
+            Some(h)
         }
-    }
-    let total: u64 = hashed.iter().map(|(_, h)| h.stat.size).sum();
+        // Files vanish mid-scan on a live system; not an error.
+        Err(e) if dedup::is_not_found(&e) => None,
+        Err(e) => {
+            eprintln!("skip {}: {e:#}", p.to_path(arena).display());
+            hash_errors += 1;
+            None
+        }
+    });
+    let total: u64 = hashed.files.iter().map(|(_, h)| h.stat.size).sum();
     eprintln!(
         "hashed {} files ({hits} from cache), {} total",
-        hashed.len(),
+        hashed.files.len(),
         human(total)
     );
 

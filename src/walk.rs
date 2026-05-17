@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::fmt;
 use std::io::ErrorKind;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,39 +10,102 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use rustix::fs::{FsWord, statfs, statvfs};
 
-// A path split at the last component. The parent Arc is shared between
-// siblings (jwalk already keeps it that way), so for trees with many
-// files per directory the per-file footprint is the filename plus a
-// pointer instead of the full path string. Cuts the path list -- the
-// largest fixed cost on big scans -- by ~3x.
+// File paths split at the last component. Parents are Arc-shared with
+// siblings (jwalk already keeps it that way) and filenames live in one
+// flat byte arena: no per-file heap allocation, no fat-pointer slop.
+// On a 30M-file scan this cuts the path list -- the largest fixed cost
+// in RAM -- by more than half.
+pub struct Paths<T> {
+    arena: Vec<u8>,
+    pub files: Vec<(FilePath, T)>,
+}
+
+// 24 bytes; was 32 plus a heap allocation per file.
 pub struct FilePath {
     parent: Arc<Path>,
-    name: Box<OsStr>,
+    off: u32,
+    len: u32,
 }
 
 impl FilePath {
-    pub fn to_path(&self) -> PathBuf {
-        self.parent.join(Path::new(&self.name))
+    pub fn to_path(&self, arena: &[u8]) -> PathBuf {
+        let name = &arena[self.off as usize..(self.off + self.len) as usize];
+        self.parent.join(Path::new(OsStr::from_bytes(name)))
+    }
+}
+
+impl<T> Paths<T> {
+    pub fn path(&self, fp: &FilePath) -> PathBuf {
+        fp.to_path(&self.arena)
     }
 
-    // For tests and fixtures that already have a full PathBuf.
-    pub fn from_path(p: &Path) -> Self {
+    fn push(&mut self, parent: Arc<Path>, name: &OsStr, payload: T) {
+        let off = u32::try_from(self.arena.len()).expect("path arena overflow");
+        self.arena.extend_from_slice(name.as_bytes());
+        self.files.push((
+            FilePath {
+                parent,
+                off,
+                len: name.len() as u32,
+            },
+            payload,
+        ));
+    }
+
+    // Re-tag the payloads in batches, sharing the same arena. The step
+    // function controls when intermediate state (e.g. hash buffers) is
+    // dropped between batches.
+    pub fn map_batched<U>(
+        self,
+        batch: usize,
+        mut step: impl FnMut(&[u8], Vec<(FilePath, T)>) -> Result<Vec<(FilePath, U)>>,
+    ) -> Result<Paths<U>> {
+        let Self { arena, files } = self;
+        let mut out = Vec::with_capacity(files.len());
+        let mut iter = files.into_iter();
+        loop {
+            let chunk: Vec<_> = iter.by_ref().take(batch).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            out.extend(step(&arena, chunk)?);
+        }
+        Ok(Paths { arena, files: out })
+    }
+
+    // Drop payloads the closure rejects; the arena keeps unused names
+    // (cheaper than compacting and harmless).
+    pub fn filter_map<U>(self, mut f: impl FnMut(&FilePath, T, &[u8]) -> Option<U>) -> Paths<U> {
+        let Self { arena, files } = self;
+        let files = files
+            .into_iter()
+            .filter_map(|(p, t)| f(&p, t, &arena).map(|u| (p, u)))
+            .collect();
+        Paths { arena, files }
+    }
+}
+
+impl<T> Default for Paths<T> {
+    fn default() -> Self {
         Self {
-            parent: Arc::from(p.parent().unwrap_or(Path::new(""))),
-            name: Box::from(p.file_name().unwrap_or(OsStr::new(""))),
+            arena: Vec::new(),
+            files: Vec::new(),
         }
     }
 }
 
-impl fmt::Debug for FilePath {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.to_path().fmt(f)
-    }
-}
-
-impl fmt::Display for FilePath {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.to_path().display().fmt(f)
+// For tests and fixtures that already have full PathBufs.
+impl<T> FromIterator<(PathBuf, T)> for Paths<T> {
+    fn from_iter<I: IntoIterator<Item = (PathBuf, T)>>(iter: I) -> Self {
+        let mut out = Self::default();
+        for (p, t) in iter {
+            out.push(
+                Arc::from(p.parent().unwrap_or(Path::new(""))),
+                p.file_name().unwrap_or(OsStr::new("")),
+                t,
+            );
+        }
+        out
     }
 }
 
@@ -121,9 +184,9 @@ pub fn fsid(p: &Path) -> Result<u64> {
 pub fn files<'a>(
     roots: impl IntoIterator<Item = &'a PathBuf>,
     exclude: &HashSet<(u64, u64)>,
-) -> Vec<(FilePath, u64)> {
+) -> Paths<u64> {
     let mut seen = HashSet::new();
-    let mut out = Vec::new();
+    let mut out = Paths::default();
     for root in roots {
         let stat = || anyhow::Ok((std::fs::metadata(root)?.dev(), fsid(root)?));
         let (dev, fsid) = match stat() {
@@ -148,7 +211,7 @@ fn walk_root(
     fsid: u64,
     exclude: &HashSet<(u64, u64)>,
     seen: &mut HashSet<(u64, u64)>,
-    out: &mut Vec<(FilePath, u64)>,
+    out: &mut Paths<u64>,
 ) {
     // process_read_dir runs on rayon threads: stat there so the per-file
     // syscall is parallel. The for loop below is single-threaded and
@@ -218,13 +281,7 @@ fn walk_root(
         if nlink > 1 && !seen.insert((dev, ino)) {
             continue;
         }
-        out.push((
-            FilePath {
-                parent: entry.parent_path.clone(),
-                name: entry.file_name.clone().into_boxed_os_str(),
-            },
-            fsid,
-        ));
+        out.push(entry.parent_path.clone(), &entry.file_name, fsid);
     }
 }
 
@@ -246,10 +303,17 @@ mod tests {
         let dev = std::fs::metadata(p).unwrap().dev();
         let names = |excl: &HashSet<(u64, u64)>| {
             let mut seen = HashSet::new();
-            let mut out = Vec::new();
+            let mut out = Paths::default();
             super::walk_root(p, dev, 0, excl, &mut seen, &mut out);
-            out.into_iter()
-                .map(|(f, _)| f.name.to_string_lossy().into_owned())
+            out.files
+                .iter()
+                .map(|(f, _)| {
+                    out.path(f)
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
                 .collect::<Vec<_>>()
         };
 

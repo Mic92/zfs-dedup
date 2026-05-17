@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -9,7 +10,7 @@ use rayon::prelude::*;
 use crate::cache::{Cache, ChunkHash};
 use crate::clone::{Dedupe, clone_range, dedupe_range};
 use crate::hasher::{Hashed, NOFOLLOW_NONBLOCK, ZERO_HASH};
-use crate::walk::FilePath;
+use crate::walk::{FilePath, Paths};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
@@ -204,7 +205,7 @@ fn each_chunk(
 // concurrently, which ZFS handles fine. Groups never share a
 // (file, chunk) since each chunk has exactly one hash.
 struct Worker<'a> {
-    files: &'a [(FilePath, Hashed)],
+    files: &'a Paths<Hashed>,
     opts: Opts,
     buf_a: Vec<u8>,
     buf_b: Vec<u8>,
@@ -218,7 +219,7 @@ pub struct Opts {
 }
 
 impl<'a> Worker<'a> {
-    fn new(files: &'a [(FilePath, Hashed)], opts: Opts) -> Self {
+    fn new(files: &'a Paths<Hashed>, opts: Opts) -> Self {
         Self {
             files,
             opts,
@@ -228,8 +229,16 @@ impl<'a> Worker<'a> {
         }
     }
 
+    fn path(&self, i: usize) -> PathBuf {
+        self.files.path(&self.files.files[i].0)
+    }
+
+    fn hashed(&self, i: usize) -> &Hashed {
+        &self.files.files[i].1
+    }
+
     fn open(&self, i: usize, write: bool) -> Result<File> {
-        let p = self.files[i].0.to_path();
+        let p = self.path(i);
         File::options()
             .read(true)
             .write(write && !self.opts.dry_run)
@@ -242,7 +251,7 @@ impl<'a> Worker<'a> {
         // locs[0] is the canonical source: open and read it once,
         // clone the rest from it.
         let src = locs[0];
-        let len = chunk_len(&self.files[src.file as usize].1, src.chunk as u64, blksz);
+        let len = chunk_len(self.hashed(src.file as usize), src.chunk as u64, blksz);
         if len == 0 {
             return; // past stat.size: file grew after stat
         }
@@ -264,7 +273,7 @@ impl<'a> Worker<'a> {
             Err(e) => {
                 eprintln!(
                     "skip group {:?}+{src_off}: {e:#}",
-                    self.files[src.file as usize].0
+                    self.path(src.file as usize)
                 );
                 self.stats.errors += 1;
                 return;
@@ -272,7 +281,7 @@ impl<'a> Worker<'a> {
         };
 
         for &dst in &locs[1..] {
-            if len != chunk_len(&self.files[dst.file as usize].1, dst.chunk as u64, blksz) {
+            if len != chunk_len(self.hashed(dst.file as usize), dst.chunk as u64, blksz) {
                 continue; // tail-vs-full mismatch or stale index
             }
             self.stats.candidates += 1;
@@ -290,9 +299,9 @@ impl<'a> Worker<'a> {
                 Err(e) => {
                     eprintln!(
                         "skip {:?}+{} <- {:?}+{src_off}: {e:#}",
-                        self.files[dst.file as usize].0,
+                        self.path(dst.file as usize),
                         dst.off(blksz),
-                        self.files[src.file as usize].0,
+                        self.path(src.file as usize),
                     );
                     self.stats.errors += 1;
                 }
@@ -336,8 +345,8 @@ impl<'a> Worker<'a> {
     }
 }
 
-pub fn dedup(files: &[(FilePath, Hashed)], cache: &Cache, opts: Opts) -> Result<Stats> {
-    let idx = build_index(files, cache)?;
+pub fn dedup(files: &Paths<Hashed>, cache: &Cache, opts: Opts) -> Result<Stats> {
+    let idx = build_index(&files.files, cache)?;
     let groups: Vec<_> = idx.into_iter().collect();
     Ok(groups
         .into_par_iter()
@@ -399,7 +408,7 @@ mod tests {
 
         // Real file with a fixed blksz, ignoring whatever st_blksize
         // the test filesystem happens to report.
-        fn file(&self, name: &str, data: &[u8], blksz: u32, fsid: u64) -> (FilePath, Hashed) {
+        fn file(&self, name: &str, data: &[u8], blksz: u32, fsid: u64) -> (PathBuf, Hashed) {
             let hashes = {
                 let p = self.dir.path().join(name);
                 std::fs::write(&p, data).unwrap();
@@ -416,7 +425,7 @@ mod tests {
             blksz: u32,
             fsid: u64,
             hashes: &[ChunkHash],
-        ) -> (FilePath, Hashed) {
+        ) -> (PathBuf, Hashed) {
             let p = self.dir.path().join(name);
             if !p.exists() {
                 std::fs::write(&p, vec![0u8; size as usize]).unwrap();
@@ -429,7 +438,7 @@ mod tests {
                 .put_many([(stat.fsid, stat.ino, stat.entry(hashes))])
                 .unwrap();
             (
-                FilePath::from_path(&p),
+                p,
                 Hashed {
                     stat,
                     from_cache: false,
@@ -437,8 +446,9 @@ mod tests {
             )
         }
 
-        fn dedup(&self, files: &[(FilePath, Hashed)], opts: Opts) -> Stats {
-            dedup(files, &self.cache, opts).unwrap()
+        fn dedup(&self, files: impl IntoIterator<Item = (PathBuf, Hashed)>, opts: Opts) -> Stats {
+            let paths: Paths<Hashed> = files.into_iter().collect();
+            dedup(&paths, &self.cache, opts).unwrap()
         }
     }
 
@@ -477,7 +487,7 @@ mod tests {
         let mut b = blk.clone();
         b.extend_from_slice(&[2u8; 4096]);
         let files = [tx.file("a", &a, 4096, 0), tx.file("b", &b, 4096, 0)];
-        let stats = tx.dedup(&files, DRY);
+        let stats = tx.dedup(files, DRY);
         assert_eq!(stats.candidates, 1);
         assert_eq!(stats.verified, 1);
         assert_eq!(stats.cloned, 0);
@@ -491,7 +501,7 @@ mod tests {
             tx.file("a", &[1u8; 4096], 4096, 0),
             tx.file("b", &[2u8; 4096], 4096, 0),
         ];
-        assert_eq!(tx.dedup(&files, DRY).candidates, 0);
+        assert_eq!(tx.dedup(files, DRY).candidates, 0);
     }
 
     #[test]
@@ -499,7 +509,7 @@ mod tests {
         let tx = Tx::new();
         let z = [0u8; 8192];
         let files = [tx.file("a", &z, 4096, 0), tx.file("b", &z, 4096, 0)];
-        assert_eq!(tx.dedup(&files, DRY).candidates, 0);
+        assert_eq!(tx.dedup(files, DRY).candidates, 0);
     }
 
     #[test]
@@ -509,13 +519,13 @@ mod tests {
         let tx = Tx::new();
         let data = [9u8; 4096];
         let files = [tx.file("ro", &data, 4096, 0), tx.file("rw", &data, 4096, 0)];
-        std::fs::set_permissions(files[0].0.to_path(), std::fs::Permissions::from_mode(0o400))
-            .unwrap();
+        std::fs::set_permissions(&files[0].0, std::fs::Permissions::from_mode(0o400)).unwrap();
         let opts = Opts {
             dry_run: false,
             fideduperange: false,
         };
-        let w = Worker::new(&files, opts);
+        let paths: Paths<Hashed> = files.into_iter().collect();
+        let w = Worker::new(&paths, opts);
         w.open(0, false).expect("read-only source must open");
         w.open(1, true).expect("writable dest must open");
     }
@@ -530,7 +540,7 @@ mod tests {
         for (_, h) in &mut files {
             h.stat.size = 0;
         }
-        assert_eq!(tx.dedup(&files, DRY).verified, 0);
+        assert_eq!(tx.dedup(files, DRY).verified, 0);
     }
 
     // Two distinct chunk hashes that share the upper 8 bytes collide on
@@ -546,7 +556,7 @@ mod tests {
             tx.synth("a", 4096, 4096, 0, &[ha]),
             tx.synth("b", 4096, 4096, 0, &[hb]),
         ];
-        assert_eq!(tx.dedup(&files, DRY).candidates, 0);
+        assert_eq!(tx.dedup(files, DRY).candidates, 0);
     }
 
     // Each ZFS dataset is its own superblock; the kernel rejects cross-
@@ -557,7 +567,7 @@ mod tests {
         let tx = Tx::new();
         let data = [9u8; 4096];
         let files = [tx.file("a", &data, 4096, 0), tx.file("b", &data, 4096, 1)];
-        assert_eq!(tx.dedup(&files, DRY).candidates, 0);
+        assert_eq!(tx.dedup(files, DRY).candidates, 0);
     }
 
     #[test]
@@ -569,6 +579,6 @@ mod tests {
             tx.synth("a", 4096, 4096, 0, &[hash_chunk(&data)]),
             tx.synth("b", 4096, 8192, 0, &[hash_chunk(&data)]),
         ];
-        assert_eq!(tx.dedup(&files, DRY).candidates, 0);
+        assert_eq!(tx.dedup(files, DRY).candidates, 0);
     }
 }

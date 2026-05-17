@@ -5,7 +5,7 @@ use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
-use crate::walk::FilePath;
+use crate::walk::Paths;
 use std::ptr::NonNull;
 
 use anyhow::{Context, Result, ensure};
@@ -181,25 +181,15 @@ pub struct Hashed {
     pub from_cache: bool,
 }
 
-// Hash and persist `paths`; the returned vec carries no hashes.
+// Hash and persist `paths`; the returned set carries no hashes.
 // Process in batches so the per-file hash vectors are short-lived
 // instead of accumulating until the end.
-pub fn hash_files(
-    cache: &Cache,
-    paths: Vec<(FilePath, u64)>,
-) -> Result<Vec<(FilePath, Result<Hashed>)>> {
-    const BATCH: usize = 100_000;
-    let mut out = Vec::with_capacity(paths.len());
-    let mut iter = paths.into_iter();
-    loop {
-        let batch: Vec<_> = iter.by_ref().take(BATCH).collect();
-        if batch.is_empty() {
-            break;
-        }
+pub fn hash_files(cache: &Cache, paths: Paths<u64>) -> Result<Paths<Result<Hashed>>> {
+    paths.map_batched(100_000, |arena, batch| {
         let results: Vec<_> = batch
             .into_par_iter()
             .map(|(p, fsid)| {
-                let r = hash_one(cache, &p.to_path(), fsid);
+                let r = hash_one(cache, &p.to_path(arena), fsid);
                 (p, r)
             })
             .collect();
@@ -209,9 +199,11 @@ pub fn hash_files(
             }
             _ => None,
         }))?;
-        out.extend(results.into_iter().map(|(p, r)| (p, r.map(|(h, _)| h))));
-    }
-    Ok(out)
+        Ok(results
+            .into_iter()
+            .map(|(p, r)| (p, r.map(|(h, _)| h)))
+            .collect())
+    })
 }
 
 fn hash_one(cache: &Cache, path: &Path, fsid: u64) -> Result<(Hashed, Box<[ChunkHash]>)> {
@@ -312,15 +304,23 @@ mod tests {
         let cache = Cache::open(&dir.path().join("c.redb")).unwrap();
         let p = dir.path().join("f");
         std::fs::write(&p, vec![7; 8192]).unwrap();
-        let ps = || vec![(FilePath::from_path(&p), 0u64)];
-
+        let ps = || [(p.clone(), 0u64)].into_iter().collect::<Paths<u64>>();
+        let one = |paths: Paths<u64>| {
+            hash_files(&cache, paths)
+                .unwrap()
+                .files
+                .pop()
+                .unwrap()
+                .1
+                .unwrap()
+        };
         let cached = |s: &Stat| cache.get(s.fsid, s.ino).unwrap().unwrap().hashes;
 
-        let a = hash_files(&cache, ps()).unwrap().pop().unwrap().1.unwrap();
+        let a = one(ps());
         assert!(!a.from_cache);
         let ha = cached(&a.stat);
 
-        let b = hash_files(&cache, ps()).unwrap().pop().unwrap().1.unwrap();
+        let b = one(ps());
         assert!(b.from_cache);
         assert_eq!(ha, cached(&b.stat));
 
@@ -332,7 +332,7 @@ mod tests {
             .write_all(&[1; 4096])
             .unwrap();
 
-        let c = hash_files(&cache, ps()).unwrap().pop().unwrap().1.unwrap();
+        let c = one(ps());
         assert!(!c.from_cache);
         assert_ne!(ha, cached(&c.stat));
     }
