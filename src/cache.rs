@@ -152,14 +152,16 @@ impl Cache {
     }
 
     // Drop unseen entries on datasets we scanned. Scoping to `fsids`
-    // keeps a partial scan from evicting cache for trees it never visited.
-    pub fn prune(&self, seen: &HashSet<(u64, u64)>, fsids: &HashSet<u64>) -> Result<usize> {
+    // keeps a partial scan from evicting cache for trees it never
+    // visited. `seen` may over-answer (Bloom filter): a false positive
+    // keeps a stale entry one run too long.
+    pub fn prune(&self, seen: impl Fn(u64, u64) -> bool, fsids: &HashSet<u64>) -> Result<usize> {
         let tx = self.db.begin_write()?;
         let mut removed = 0;
         {
             let mut table = tx.open_table(FILES)?;
-            table.retain(|k, _| {
-                let keep = !fsids.contains(&k.0) || seen.contains(&k);
+            table.retain(|(fsid, ino), _| {
+                let keep = !fsids.contains(&fsid) || seen(fsid, ino);
                 if !keep {
                     removed += 1;
                 }
@@ -262,8 +264,13 @@ mod tests {
         for i in 0..5 {
             cache.put(0, i, e.as_ref()).unwrap();
         }
-        let seen: HashSet<_> = [(0, 1), (0, 3)].into();
-        assert_eq!(cache.prune(&seen, &[0].into()).unwrap(), 3);
+        let seen: HashSet<_> = [(0u64, 1u64), (0, 3)].into();
+        assert_eq!(
+            cache
+                .prune(|f, i| seen.contains(&(f, i)), &[0].into())
+                .unwrap(),
+            3
+        );
         assert!(cache.get(0, 0).unwrap().is_none());
         assert!(cache.get(0, 1).unwrap().is_some());
         assert!(cache.get(0, 2).unwrap().is_none());
@@ -281,7 +288,7 @@ mod tests {
         cache
             .put_many((0..2000).map(|i| (0, i, e.as_ref())))
             .unwrap();
-        cache.prune(&HashSet::new(), &[0].into()).unwrap();
+        cache.prune(|_, _| false, &[0].into()).unwrap();
         assert!(cache.compact_if_bloated().unwrap(), "after big prune");
         assert!(!cache.compact_if_bloated().unwrap(), "already compacted");
     }
@@ -294,7 +301,7 @@ mod tests {
         cache.put(1, 0, e.as_ref()).unwrap();
         cache.put(2, 0, e.as_ref()).unwrap();
         // Scanned fsid 1, saw nothing: prune fsid 1 only, fsid 2 untouched.
-        assert_eq!(cache.prune(&HashSet::new(), &[1].into()).unwrap(), 1);
+        assert_eq!(cache.prune(|_, _| false, &[1].into()).unwrap(), 1);
         assert!(cache.get(1, 0).unwrap().is_none());
         assert!(cache.get(2, 0).unwrap().is_some());
     }
