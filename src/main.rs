@@ -6,6 +6,11 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use zfs_dedup::{bloom, cache::Cache, clone, dedup, hasher, remount, walk};
 
+// Returns freed pages to the OS (MADV_FREE); glibc's per-thread arenas
+// retain freed memory and inflate RSS for the rest of the run.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // Mix (fsid, ino) into one 64-bit key for the prune Bloom filter.
 // SplitMix64-style finalizer so closely spaced inodes scatter.
 fn prune_key(fsid: u64, ino: u64) -> u64 {

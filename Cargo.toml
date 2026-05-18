@@ -14,6 +14,7 @@ jwalk = "0.8"
 anyhow = "1"
 lexopt = "0.3"
 tempfile = "3"
+mimalloc = "0.1.50"
 
 [dev-dependencies]
 divan = "0.1"
