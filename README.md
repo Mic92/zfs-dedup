@@ -1,9 +1,10 @@
 # zfs-dedup
 
 Reclaim space from duplicate files on ZFS without turning on
-deduplication. Scans your datasets, finds blocks with identical
-content, and reflinks them with block cloning. Runs offline, no DDT,
-no extra RAM.
+deduplication. It scans your datasets, finds blocks with identical
+content, and reflinks them with block cloning.
+zfs-dedup runs offline unlike zfs own deduplication,
+it doesn't require additional memory, when it doesn't run.
 
 ```
 % sudo zfs-dedup ~/
@@ -66,20 +67,18 @@ get rehashed.
 
 Deduping safely needs to compare two ranges and clone them in one
 operation, otherwise something could write to one of them in between.
-Stock OpenZFS doesn't have an ioctl that does both, so by default
+Stock OpenZFS doesn't have this ioctl yet, so by default
 zfs-dedup refuses unless you pass `--force` to accept the small race
-window.
+window. Only use `--force` when you are sure that no process will modify your data,
+while `zfs-dedup` runs.
 
-For the safe path, run a kernel module built from
-<https://github.com/Mic92/zfs/tree/fideduperange>. It adds
-FIDEDUPERANGE support, which zfs-dedup uses automatically when
-available.
+The patch for ioctl currently lives in this branch: <https://github.com/Mic92/zfs/tree/fideduperange>.
+It adds FIDEDUPERANGE support, which zfs-dedup uses automatically when available.
 
 ## Memory
 
-Figure ~250 MiB per million files in the largest dataset you scan, plus
-~100 MiB fixed. Datasets are scanned one at a time, so it's the biggest
-one that matters, not the sum. File sizes don't matter, only the count.
+zfs-dedup needs roughly 250 MiB per million files in the largest dataset.
+As datasets are scanned one at a time, only the biggest one that matters.
 
 | files in largest dataset | peak RSS |
 |---|---|
@@ -87,8 +86,7 @@ one that matters, not the sum. File sizes don't matter, only the count.
 | 10 M | ~2.5 GiB |
 | 50 M | ~12.5 GiB |
 
-The peak is brief, during the walk; the dedup phase that follows runs
-at about a third of that.
+The peak is brief, during the walk. The dedup phase that follows runs at about a third of that.
 
 ## Limitations
 
@@ -96,5 +94,5 @@ at about a third of that.
   or [duperemove](https://github.com/markfasheh/duperemove).
 - Files must be on the same pool and share a recordsize to be cloned
   into each other.
-- Cloned blocks share storage but show up twice in `du`; check
-  `zpool get bcloneused,bclonesaved` for actual savings.
+- Cloned blocks share storage but show up twice in `du`. Check
+  `zpool get bcloneused,bclonesaved` for actual savings, the tool also will report savings
