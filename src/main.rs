@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -214,67 +214,77 @@ proceed."
         .map(|m| (m.dev(), m.ino()))
         .into_iter()
         .collect();
-    let paths = walk::files(&dirs, &exclude);
-    let n_files = paths.files.len();
-    eprintln!("found {n_files} files");
+    let opts = dedup::Opts {
+        dry_run: args.dry_run,
+        fideduperange,
+    };
 
-    let results = hasher::hash_files(&cache, paths)?;
-    // Bloom is enough: prune may over-keep -- a false positive holds a
-    // stale cache entry one run too long. ~1.2 B/file vs ~24 in a HashSet.
-    let mut seen = bloom::Bloom::new(n_files as u64);
-    let mut hits = 0usize;
-    let mut hash_errors = 0usize;
-    let hashed = results.filter_map(|p, r, arena| match r {
-        Ok(h) => {
-            seen.insert(prune_key(h.fsid, h.ino));
-            if h.from_cache {
-                hits += 1;
-            }
-            Some(h)
-        }
-        // Files vanish mid-scan on a live system; not an error.
-        Err(e) if dedup::is_not_found(&e) => None,
-        Err(e) => {
-            eprintln!("skip {}: {e:#}", p.to_path(arena).display());
-            hash_errors += 1;
-            None
-        }
-    });
-    let total: u64 = hashed.files.iter().map(|(_, h)| h.size).sum();
-    eprintln!(
-        "hashed {} files ({hits} from cache), {} total",
-        hashed.files.len(),
-        human(total)
-    );
-
-    // Only prune datasets we scanned in full; a subdir scan covers part
-    // of a dataset and must not evict siblings it never visited.
+    // Cross-dataset cloning is impossible (FIDEDUPERANGE rejects with
+    // EXDEV before ZFS sees the call), so the index never spans fsids.
+    // Process one dataset at a time: peak RSS is bounded by the largest
+    // dataset, not their sum.
     let mount_set: HashSet<&PathBuf> = mounts.iter().collect();
-    let scanned_fsids: HashSet<u64> = dirs
-        .iter()
-        .filter(|d| mount_set.contains(d))
-        .filter_map(|d| walk::fsid(d).ok())
-        .collect();
-    let pruned = cache.prune(
-        |fsid, ino| seen.contains(prune_key(fsid, ino)),
-        &scanned_fsids,
-    )?;
-    if pruned > 0 {
-        eprintln!("pruned {pruned} stale cache entries");
+    let mut by_fsid: BTreeMap<u64, Vec<&PathBuf>> = BTreeMap::new();
+    for d in &dirs {
+        if let Ok(id) = walk::fsid(d) {
+            by_fsid.entry(id).or_default().push(d);
+        }
     }
+
+    let mut stats = dedup::Stats::default();
+    let mut total = 0u64;
+    let mut hash_errors = 0usize;
+    for (fsid, group) in by_fsid {
+        let paths = walk::files(group.iter().copied(), &exclude);
+        let n_files = paths.files.len();
+        eprintln!("{}: found {n_files} files", group[0].display());
+
+        let results = hasher::hash_files(&cache, paths)?;
+        // Bloom is enough: prune may over-keep -- a false positive holds a
+        // stale cache entry one run too long. ~1.2 B/file vs ~24 in a HashSet.
+        let mut seen = bloom::Bloom::new(n_files as u64);
+        let mut hits = 0usize;
+        let hashed = results.filter_map(|p, r, arena| match r {
+            Ok(h) => {
+                seen.insert(prune_key(h.fsid, h.ino));
+                if h.from_cache {
+                    hits += 1;
+                }
+                Some(h)
+            }
+            // Files vanish mid-scan on a live system; not an error.
+            Err(e) if dedup::is_not_found(&e) => None,
+            Err(e) => {
+                eprintln!("skip {}: {e:#}", p.to_path(arena).display());
+                hash_errors += 1;
+                None
+            }
+        });
+        let group_total: u64 = hashed.files.iter().map(|(_, h)| h.size).sum();
+        total += group_total;
+        eprintln!(
+            "  hashed {} files ({hits} from cache), {}",
+            hashed.files.len(),
+            human(group_total)
+        );
+
+        // Only prune datasets we scanned in full; a subdir scan covers part
+        // of a dataset and must not evict siblings it never visited.
+        if group.iter().all(|d| mount_set.contains(d)) {
+            let pruned = cache.prune(|f, i| seen.contains(prune_key(f, i)), &[fsid].into())?;
+            if pruned > 0 {
+                eprintln!("  pruned {pruned} stale cache entries");
+            }
+        }
+        drop(seen);
+
+        stats += dedup::dedup(&hashed, &cache, opts)?;
+    }
+
     if cache.compact_if_bloated()? {
         eprintln!("compacted cache");
     }
-    drop(seen);
 
-    let stats = dedup::dedup(
-        &hashed,
-        &cache,
-        dedup::Opts {
-            dry_run: args.dry_run,
-            fideduperange,
-        },
-    )?;
     let pct = if total > 0 {
         stats.bytes as f64 / total as f64 * 100.0
     } else {
