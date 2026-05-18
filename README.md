@@ -33,6 +33,7 @@ or `cargo build --release`.
   back to buffered reads.
 - `FIDEDUPERANGE` for in-kernel verify+clone needs a patched ZFS;
   stock ZFS requires `--force` for the userspace verify path.
+  Currently a patch living in this branch: https://github.com/Mic92/zfs/tree/fideduperange
 - Read-only ZFS bind mounts over a writable dataset (e.g.,
   `/nix/store` on NixOS) are remounted read-write in a private mount
   namespace; the host's mounts are not modified.
