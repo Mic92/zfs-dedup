@@ -52,7 +52,7 @@ impl Loc {
 
 // Index keys already contain a uniform XXH3-128 hash, so the HashMap
 // doesn't need SipHash on top: take 8 bytes of the chunk hash and fold
-// in blksz/fsid.
+// in blksz.
 #[derive(Default)]
 pub struct ChunkKeyHasher(u64);
 
@@ -78,38 +78,31 @@ impl Hasher for ChunkKeyHasher {
     }
 }
 
-// Maps (blksz, fsid, hash) to the chunks that share that hash.
-// blksz and fsid are part of the key because two chunks can only clone
-// when they match: the VFS rejects cross-superblock FIDEDUPERANGE with
-// EXDEV (each ZFS dataset is its own superblock), and zfs_clone_range
-// rejects cross-blocksize clones.
-pub type Index = HashMap<(u32, u64, ChunkHash), Vec<Loc>, BuildHasherDefault<ChunkKeyHasher>>;
+// Maps (blksz, hash) to the chunks that share that hash. blksz is in
+// the key because zfs_clone_range rejects cross-blocksize clones.
+pub type Index = HashMap<(u32, ChunkHash), Vec<Loc>, BuildHasherDefault<ChunkKeyHasher>>;
 
-// 8-byte version of the index key, for pass 1's pre-filter. Half the
-// memory of the full key. A truncation collision falsely flags a
-// singleton as a duplicate; pass 2 keys by the full hash, so the false
-// group ends up with one Loc and the trailing retain drops it.
-fn dup_key(blksz: u32, fsid: u64, h: &ChunkHash) -> u64 {
+// Truncated index key for the pre-filter set: 8 bytes vs 20. Collisions
+// are safe -- pass 2 re-keys by the full hash, so a colliding singleton
+// becomes a one-Loc group and the trailing retain drops it.
+fn dup_key(blksz: u32, h: &ChunkHash) -> u64 {
     u64::from_le_bytes(h[8..16].try_into().expect("16-byte hash"))
         ^ u64::from(blksz).wrapping_mul(0x9e3779b97f4a7c15)
-        ^ fsid.wrapping_mul(0xff51afd7ed558ccd)
 }
 
-// Find every chunk whose hash appears more than once and group their
-// locations. The output drives the dedup phase: each group is a set of
-// blocks that should be byte-identical and can be cloned together.
+// Group every chunk whose hash repeats. Each group is a set of blocks
+// that should be byte-identical; the dedup phase clones each into one.
 //
 // Two passes over the chunk stream:
-//   1. Bloom pre-filter -> `dup`: the set of hashes seen at least twice.
-//   2. For chunks whose hash is in `dup`, record their Loc in `idx`.
+//   1. Bloom pre-filter -> `dup`: hashes seen at least twice.
+//   2. For chunks in `dup`, record their Loc in `idx`.
 //
-// One pass would have to record every chunk and discard the singletons
-// at the end, allocating several times the final index size on a
-// low-duplication tree.
+// One pass would record every chunk and drop the singletons at the
+// end, allocating several times the final index size on a low-dup tree.
 //
-// Hashes are read back from the redb cache, not held in RAM; hash_files
-// just wrote them so the reads are page-cache hits. RSS is bounded by
-// the index (duplicate chunks only), not by the total chunk count.
+// Hashes stream from the redb cache, not RAM. hash_files just wrote
+// them so the reads are page-cache warm. RSS is bounded by duplicate
+// chunks, not total chunks.
 pub fn build_index(files: &[(FilePath, Hashed)], cache: &Cache) -> Result<Index> {
     assert!(
         u32::try_from(files.len()).is_ok(),
@@ -126,7 +119,7 @@ pub fn build_index(files: &[(FilePath, Hashed)], cache: &Cache) -> Result<Index>
     let mut seen = Bloom::new(n_chunks);
     let mut dup = Pre::default();
     each_chunk(files, cache, |_, _, h, hash| {
-        let k = dup_key(h.blksz, h.fsid, hash);
+        let k = dup_key(h.blksz, hash);
         if seen.check_insert(k) {
             dup.insert(k);
         }
@@ -135,10 +128,10 @@ pub fn build_index(files: &[(FilePath, Hashed)], cache: &Cache) -> Result<Index>
 
     let mut idx = Index::default();
     each_chunk(files, cache, |fi, ci, h, hash| {
-        if !dup.contains(&dup_key(h.blksz, h.fsid, hash)) {
+        if !dup.contains(&dup_key(h.blksz, hash)) {
             return;
         }
-        idx.entry((h.blksz, h.fsid, *hash)).or_default().push(Loc {
+        idx.entry((h.blksz, *hash)).or_default().push(Loc {
             file: fi as u32,
             chunk: u32::try_from(ci).expect("file too large for index"),
         });
@@ -326,12 +319,15 @@ impl<'a> Worker<'a> {
     }
 }
 
+// Dedup duplicate chunks within `files`. The caller must pass files
+// from a single ZFS dataset: the VFS rejects cross-superblock
+// FIDEDUPERANGE with EXDEV, and the index does not partition by fsid.
 pub fn dedup(files: &Paths<Hashed>, cache: &Cache, opts: Opts) -> Result<Stats> {
     Ok(build_index(&files.files, cache)?
         .into_par_iter()
         .fold(
             || Worker::new(files, opts),
-            |mut w, ((blksz, ..), locs)| {
+            |mut w, ((blksz, _), locs)| {
                 w.group(blksz as u64, &locs);
                 w
             },
@@ -356,8 +352,8 @@ pub fn is_not_found(e: &anyhow::Error) -> bool {
 }
 
 // Bytes in chunk `chunk` of a file of `h.size` bytes; the last chunk is
-// short. Returns 0 when the chunk is past EOF, which happens when the
-// file shrank between stat() and now -- callers skip those.
+// short. Returns 0 if the chunk's offset is at or past EOF: defensive
+// against a stale index entry, which callers skip.
 fn chunk_len(h: &Hashed, chunk: u64, blksz: u64) -> u64 {
     let off = chunk * blksz;
     h.size.saturating_sub(off).min(blksz)
@@ -388,13 +384,13 @@ mod tests {
 
         // Real file with a fixed blksz, ignoring whatever st_blksize
         // the test filesystem happens to report.
-        fn file(&self, name: &str, data: &[u8], blksz: u32, fsid: u64) -> (PathBuf, Hashed) {
+        fn file(&self, name: &str, data: &[u8], blksz: u32) -> (PathBuf, Hashed) {
             let hashes = {
                 let p = self.dir.path().join(name);
                 std::fs::write(&p, data).unwrap();
                 hash_file(&p, blksz).unwrap()
             };
-            self.synth(name, data.len() as u64, blksz, fsid, &hashes)
+            self.synth(name, data.len() as u64, blksz, &hashes)
         }
 
         // File with caller-supplied chunk hashes (collision tests etc.).
@@ -403,7 +399,6 @@ mod tests {
             name: &str,
             size: u64,
             blksz: u32,
-            fsid: u64,
             hashes: &[ChunkHash],
         ) -> (PathBuf, Hashed) {
             let p = self.dir.path().join(name);
@@ -411,7 +406,7 @@ mod tests {
                 std::fs::write(&p, vec![0u8; size as usize]).unwrap();
             }
             let m = std::fs::metadata(&p).unwrap();
-            let mut stat = Stat::from_metadata(&m, fsid);
+            let mut stat = Stat::from_metadata(&m, 0);
             stat.blksz = blksz;
             stat.size = size;
             self.cache
@@ -443,7 +438,7 @@ mod tests {
         a.extend_from_slice(&[1u8; 4096]);
         let mut b = blk.clone();
         b.extend_from_slice(&[2u8; 4096]);
-        let files = [tx.file("a", &a, 4096, 0), tx.file("b", &b, 4096, 0)];
+        let files = [tx.file("a", &a, 4096), tx.file("b", &b, 4096)];
         let stats = tx.dedup(files, DRY);
         assert_eq!(stats.candidates, 1);
         assert_eq!(stats.verified, 1);
@@ -455,8 +450,8 @@ mod tests {
     fn no_dupes() {
         let tx = Tx::new();
         let files = [
-            tx.file("a", &[1u8; 4096], 4096, 0),
-            tx.file("b", &[2u8; 4096], 4096, 0),
+            tx.file("a", &[1u8; 4096], 4096),
+            tx.file("b", &[2u8; 4096], 4096),
         ];
         assert_eq!(tx.dedup(files, DRY).candidates, 0);
     }
@@ -465,7 +460,7 @@ mod tests {
     fn ignores_zeros() {
         let tx = Tx::new();
         let z = [0u8; 8192];
-        let files = [tx.file("a", &z, 4096, 0), tx.file("b", &z, 4096, 0)];
+        let files = [tx.file("a", &z, 4096), tx.file("b", &z, 4096)];
         assert_eq!(tx.dedup(files, DRY).candidates, 0);
     }
 
@@ -475,7 +470,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tx = Tx::new();
         let data = [9u8; 4096];
-        let files = [tx.file("ro", &data, 4096, 0), tx.file("rw", &data, 4096, 0)];
+        let files = [tx.file("ro", &data, 4096), tx.file("rw", &data, 4096)];
         std::fs::set_permissions(&files[0].0, std::fs::Permissions::from_mode(0o400)).unwrap();
         let opts = Opts {
             dry_run: false,
@@ -493,7 +488,7 @@ mod tests {
         // offsets past stat.size. Must skip them, not underflow.
         let tx = Tx::new();
         let data = [9u8; 8192];
-        let mut files = [tx.file("a", &data, 4096, 0), tx.file("b", &data, 4096, 0)];
+        let mut files = [tx.file("a", &data, 4096), tx.file("b", &data, 4096)];
         for (_, h) in &mut files {
             h.size = 0;
         }
@@ -508,22 +503,11 @@ mod tests {
         let ha = [0xaa; 16];
         let mut hb = [0xbb; 16];
         hb[8..].copy_from_slice(&[0xaa; 8]);
-        assert_eq!(dup_key(4096, 0, &ha), dup_key(4096, 0, &hb));
+        assert_eq!(dup_key(4096, &ha), dup_key(4096, &hb));
         let files = [
-            tx.synth("a", 4096, 4096, 0, &[ha]),
-            tx.synth("b", 4096, 4096, 0, &[hb]),
+            tx.synth("a", 4096, 4096, &[ha]),
+            tx.synth("b", 4096, 4096, &[hb]),
         ];
-        assert_eq!(tx.dedup(files, DRY).candidates, 0);
-    }
-
-    // Each ZFS dataset is its own superblock; the kernel rejects cross-
-    // superblock FIDEDUPERANGE/FICLONERANGE with EXDEV before ZFS sees
-    // it. Files on different datasets must never be candidates.
-    #[test]
-    fn cross_dataset() {
-        let tx = Tx::new();
-        let data = [9u8; 4096];
-        let files = [tx.file("a", &data, 4096, 0), tx.file("b", &data, 4096, 1)];
         assert_eq!(tx.dedup(files, DRY).candidates, 0);
     }
 
@@ -533,8 +517,8 @@ mod tests {
         let data = [9u8; 4096];
         // Same bytes, same hash, different blksz: must not be a candidate.
         let files = [
-            tx.synth("a", 4096, 4096, 0, &[hash_chunk(&data)]),
-            tx.synth("b", 4096, 8192, 0, &[hash_chunk(&data)]),
+            tx.synth("a", 4096, 4096, &[hash_chunk(&data)]),
+            tx.synth("b", 4096, 8192, &[hash_chunk(&data)]),
         ];
         assert_eq!(tx.dedup(files, DRY).candidates, 0);
     }
