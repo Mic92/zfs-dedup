@@ -97,3 +97,7 @@ The peak is brief, during the walk. The dedup phase that follows runs at about a
   into each other.
 - Cloned blocks share storage but show up twice in `du`. Check
   `zpool get bcloneused,bclonesaved` for actual savings, the tool also will report savings
+
+## License
+
+MIT
