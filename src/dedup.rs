@@ -125,8 +125,8 @@ pub fn build_index(files: &[(FilePath, Hashed)], cache: &Cache) -> Result<Index>
     // possible dup -- a one-element group the trailing retain drops.
     let mut seen = Bloom::new(n_chunks);
     let mut dup = Pre::default();
-    each_chunk(files, cache, |_, _, blksz, fsid, hash| {
-        let k = dup_key(blksz, fsid, hash);
+    each_chunk(files, cache, |_, _, h, hash| {
+        let k = dup_key(h.blksz, h.fsid, hash);
         if seen.check_insert(k) {
             dup.insert(k);
         }
@@ -134,11 +134,11 @@ pub fn build_index(files: &[(FilePath, Hashed)], cache: &Cache) -> Result<Index>
     drop(seen);
 
     let mut idx = Index::default();
-    each_chunk(files, cache, |fi, ci, blksz, fsid, hash| {
-        if !dup.contains(&dup_key(blksz, fsid, hash)) {
+    each_chunk(files, cache, |fi, ci, h, hash| {
+        if !dup.contains(&dup_key(h.blksz, h.fsid, hash)) {
             return;
         }
-        idx.entry((blksz, fsid, *hash)).or_default().push(Loc {
+        idx.entry((h.blksz, h.fsid, *hash)).or_default().push(Loc {
             file: fi as u32,
             chunk: u32::try_from(ci).expect("file too large for index"),
         });
@@ -151,10 +151,11 @@ pub fn build_index(files: &[(FilePath, Hashed)], cache: &Cache) -> Result<Index>
 }
 
 // Visit every non-zero chunk of every file, fetching hashes from cache.
+// Calls `f(file_idx, chunk_idx, hashed, chunk_hash)`.
 fn each_chunk(
     files: &[(FilePath, Hashed)],
     cache: &Cache,
-    mut f: impl FnMut(usize, usize, u32, u64, &ChunkHash),
+    mut f: impl FnMut(usize, usize, &Hashed, &ChunkHash),
 ) -> Result<()> {
     for (fi, (_, h)) in files.iter().enumerate() {
         let Some(entry) = cache.get(h.fsid, h.ino)? else {
@@ -162,7 +163,7 @@ fn each_chunk(
         };
         for (ci, hash) in entry.hashes.iter().enumerate() {
             if *hash != ZERO_HASH {
-                f(fi, ci, h.blksz, h.fsid, hash);
+                f(fi, ci, h, hash);
             }
         }
     }
@@ -326,9 +327,7 @@ impl<'a> Worker<'a> {
 }
 
 pub fn dedup(files: &Paths<Hashed>, cache: &Cache, opts: Opts) -> Result<Stats> {
-    let idx = build_index(&files.files, cache)?;
-    let groups: Vec<_> = idx.into_iter().collect();
-    Ok(groups
+    Ok(build_index(&files.files, cache)?
         .into_par_iter()
         .fold(
             || Worker::new(files, opts),
