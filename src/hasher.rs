@@ -221,17 +221,27 @@ pub fn hash_files(cache: &Cache, paths: Paths<u64>) -> Result<Paths<Result<Hashe
 }
 
 fn hash_one(cache: &Cache, path: &Path, fsid: u64) -> Result<(Stat, bool, Box<[ChunkHash]>)> {
-    let f = open_nofollow(path).with_context(|| format!("open {path:?}"))?;
-    let meta = f.metadata()?;
+    // lstat first so a cache hit costs one syscall instead of three
+    // (open + fstat + close). Most files hit on a warm scan.
+    //
+    // Safe against the file being replaced between lstat and now: a
+    // stale cache entry feeds the index, the dedup phase opens by path
+    // and reads the new bytes, the verify mismatches, no clone happens.
+    let meta = std::fs::symlink_metadata(path).with_context(|| format!("stat {path:?}"))?;
     ensure!(meta.is_file(), "not a regular file: {path:?}");
     let stat = Stat::from_metadata(&meta, fsid);
-
     if let Some(entry) = cache.get(stat.fsid, stat.ino)?
         && entry.matches(stat.size, stat.mtime_ns, stat.ctime_ns, stat.blksz)
     {
         return Ok((stat, true, entry.hashes));
     }
 
+    // Cache miss: open and hash. Re-stat under the open fd so the cache
+    // entry is keyed and validated against the inode we actually read.
+    let f = open_nofollow(path).with_context(|| format!("open {path:?}"))?;
+    let meta = f.metadata()?;
+    ensure!(meta.is_file(), "not a regular file: {path:?}");
+    let stat = Stat::from_metadata(&meta, fsid);
     try_o_direct(&f, stat.blksz);
     let hashes = hash_fd(&f, stat.blksz)?.into_boxed_slice();
     Ok((stat, false, hashes))
