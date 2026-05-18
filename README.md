@@ -75,6 +75,21 @@ For the safe path, run a kernel module built from
 FIDEDUPERANGE support, which zfs-dedup uses automatically when
 available.
 
+## Memory
+
+Figure ~250 MiB per million files in the largest dataset you scan, plus
+~100 MiB fixed. Datasets are scanned one at a time, so it's the biggest
+one that matters, not the sum. File sizes don't matter, only the count.
+
+| files in largest dataset | peak RSS |
+|---|---|
+| 1 M | ~350 MiB |
+| 10 M | ~2.5 GiB |
+| 50 M | ~12.5 GiB |
+
+The peak is brief, during the walk; the dedup phase that follows runs
+at about a third of that.
+
 ## Limitations
 
 - ZFS only. For btrfs or XFS use [bees](https://github.com/Zygo/bees)
