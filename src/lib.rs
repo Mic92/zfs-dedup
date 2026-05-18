@@ -1,3 +1,4 @@
+pub mod bloom;
 pub mod cache;
 pub mod clone;
 pub mod dedup;
