@@ -4,7 +4,16 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use zfs_dedup::{cache::Cache, clone, dedup, hasher, remount, walk};
+use zfs_dedup::{bloom, cache::Cache, clone, dedup, hasher, remount, walk};
+
+// Mix (fsid, ino) into one 64-bit key for the prune Bloom filter.
+// SplitMix64-style finalizer so closely spaced inodes scatter.
+fn prune_key(fsid: u64, ino: u64) -> u64 {
+    let mut k = fsid.rotate_left(32) ^ ino;
+    k = (k ^ (k >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    k = (k ^ (k >> 27)).wrapping_mul(0x94d049bb133111eb);
+    k ^ (k >> 31)
+}
 
 const USAGE: &str = "\
 usage: zfs-dedup [-n] [-c CACHE] [-j N] [DIR...]
@@ -205,13 +214,14 @@ proceed."
     eprintln!("found {n_files} files");
 
     let results = hasher::hash_files(&cache, paths)?;
-    // Pre-size to skip the rehash spike (old + new tables both live).
-    let mut seen = HashSet::with_capacity(n_files);
+    // Bloom is enough: prune may over-keep -- a false positive holds a
+    // stale cache entry one run too long. ~1.2 B/file vs ~24 in a HashSet.
+    let mut seen = bloom::Bloom::new(n_files as u64);
     let mut hits = 0usize;
     let mut hash_errors = 0usize;
     let hashed = results.filter_map(|p, r, arena| match r {
         Ok(h) => {
-            seen.insert((h.fsid, h.ino));
+            seen.insert(prune_key(h.fsid, h.ino));
             if h.from_cache {
                 hits += 1;
             }
@@ -240,7 +250,10 @@ proceed."
         .filter(|d| mount_set.contains(d))
         .filter_map(|d| walk::fsid(d).ok())
         .collect();
-    let pruned = cache.prune(&seen, &scanned_fsids)?;
+    let pruned = cache.prune(
+        |fsid, ino| seen.contains(prune_key(fsid, ino)),
+        &scanned_fsids,
+    )?;
     if pruned > 0 {
         eprintln!("pruned {pruned} stale cache entries");
     }
