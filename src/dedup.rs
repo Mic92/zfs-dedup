@@ -34,9 +34,10 @@ impl std::ops::AddAssign for Stats {
     }
 }
 
-// Index entries dominate working set on big trees; keep this small.
-// u32 chunk caps a single file at 4G chunks (16 TiB at 4 KiB recordsize,
-// 512 TiB at default 128 KiB); beyond that build_index asserts.
+// One chunk in one file, identified by index into the file list and
+// chunk number. 8 bytes -- the index holds millions of these. The u32
+// chunk number caps a file at 4G chunks (16 TiB at 4 KiB recordsize);
+// build_index asserts on overflow.
 #[derive(Clone, Copy)]
 pub struct Loc {
     file: u32,
@@ -49,8 +50,9 @@ impl Loc {
     }
 }
 
-// XXH3-128 keys are already uniform; SipHash on top is wasted CPU. Take
-// the last 8 bytes of the chunk hash and fold in blksz.
+// Index keys already contain a uniform XXH3-128 hash, so the HashMap
+// doesn't need SipHash on top: take 8 bytes of the chunk hash and fold
+// in blksz/fsid.
 #[derive(Default)]
 pub struct ChunkKeyHasher(u64);
 
@@ -76,30 +78,38 @@ impl Hasher for ChunkKeyHasher {
     }
 }
 
-// One candidate group per (blksz, fsid, hash). zfs_clone_range refuses
-// cross-blocksize clones, and the VFS refuses cross-superblock (each
-// dataset is one) FIDEDUPERANGE/FICLONERANGE with EXDEV, so neither
-// pair can ever clone.
+// Maps (blksz, fsid, hash) to the chunks that share that hash.
+// blksz and fsid are part of the key because two chunks can only clone
+// when they match: the VFS rejects cross-superblock FIDEDUPERANGE with
+// EXDEV (each ZFS dataset is its own superblock), and zfs_clone_range
+// rejects cross-blocksize clones.
 pub type Index = HashMap<(u32, u64, ChunkHash), Vec<Loc>, BuildHasherDefault<ChunkKeyHasher>>;
 
-// Truncated key for the seen/dup pre-filter; halves its footprint.
-// A collision only marks a singleton as a possible dup; pass 2 indexes
-// by full key so the false group has one location and is a no-op.
+// 8-byte version of the index key, for pass 1's pre-filter. Half the
+// memory of the full key. A truncation collision falsely flags a
+// singleton as a duplicate; pass 2 keys by the full hash, so the false
+// group ends up with one Loc and the trailing retain drops it.
 fn dup_key(blksz: u32, fsid: u64, h: &ChunkHash) -> u64 {
     u64::from_le_bytes(h[8..16].try_into().expect("16-byte hash"))
         ^ u64::from(blksz).wrapping_mul(0x9e3779b97f4a7c15)
         ^ fsid.wrapping_mul(0xff51afd7ed558ccd)
 }
 
-// Two passes: mark which keys repeat, then collect locations only for
-// those. Building a Vec per chunk and discarding the singletons would
-// transiently allocate several times the final index size on low-dup
-// trees.
+// Find every chunk whose hash appears more than once and group their
+// locations. The output drives the dedup phase: each group is a set of
+// blocks that should be byte-identical and can be cloned together.
 //
-// Per-file hashes are streamed from the cache instead of held in RAM;
-// they were just written there during hashing, so the reads are all
-// page-cache hits. This bounds the working set by the index, not by
-// total chunk count.
+// Two passes over the chunk stream:
+//   1. Bloom pre-filter -> `dup`: the set of hashes seen at least twice.
+//   2. For chunks whose hash is in `dup`, record their Loc in `idx`.
+//
+// One pass would have to record every chunk and discard the singletons
+// at the end, allocating several times the final index size on a
+// low-duplication tree.
+//
+// Hashes are read back from the redb cache, not held in RAM; hash_files
+// just wrote them so the reads are page-cache hits. RSS is bounded by
+// the index (duplicate chunks only), not by the total chunk count.
 pub fn build_index(files: &[(FilePath, Hashed)], cache: &Cache) -> Result<Index> {
     assert!(
         u32::try_from(files.len()).is_ok(),
@@ -133,8 +143,9 @@ pub fn build_index(files: &[(FilePath, Hashed)], cache: &Cache) -> Result<Index>
             chunk: u32::try_from(ci).expect("file too large for index"),
         });
     })?;
-    // Truncated-key collisions in `dup` make singletons here; drop them
-    // so group() doesn't open+read a source with nothing to clone to.
+    // Bloom false positives and dup_key truncation collisions land
+    // here as one-element groups; drop them so the dedup phase doesn't
+    // open and read a source it has nothing to clone into.
     idx.retain(|_, v| v.len() > 1);
     Ok(idx)
 }
@@ -158,12 +169,17 @@ fn each_chunk(
     Ok(())
 }
 
-// Per-rayon-task state. Read buffers reused across candidates; no fd
-// cache because n_workers * n_files would blow ulimit -n on big trees,
-// and open() is dwarfed by the verify reads anyway. Two tasks may open
-// the same file (independent fds) and clone into different offsets
-// concurrently, which ZFS handles fine. Groups never share a
-// (file, chunk) since each chunk has exactly one hash.
+// Per-rayon-task state for the dedup phase: each task processes one
+// index group at a time, opening files on demand and reusing the two
+// read buffers across groups.
+//
+// No fd cache: n_workers * n_files would blow `ulimit -n`, and open()
+// is dwarfed by the verify reads.
+//
+// Two tasks may open the same file concurrently (different groups, same
+// file). They get independent fds and clone into different offsets;
+// ZFS handles that. Two groups can never touch the same (file, chunk)
+// because a chunk has exactly one hash and so belongs to one group.
 struct Worker<'a> {
     files: &'a Paths<Hashed>,
     opts: Opts,
@@ -269,8 +285,12 @@ impl<'a> Worker<'a> {
         }
     }
 
-    // Some(bytes deduped) on match, None on mismatch. `compare` selects
-    // userspace verify+FICLONERANGE; otherwise FIDEDUPERANGE in-kernel.
+    // Returns Some(bytes deduped) if the source and destination matched
+    // and were cloned, None on a hash collision (data differed).
+    //
+    // With `compare`: read both ranges, memcmp, FICLONERANGE on match.
+    // Without: FIDEDUPERANGE does the compare-and-clone in one ioctl,
+    // atomically under the inode locks.
     fn verify_and_clone(
         &mut self,
         sf: &File,
@@ -336,8 +356,9 @@ pub fn is_not_found(e: &anyhow::Error) -> bool {
     })
 }
 
-// 0 if `chunk` is past stat.size: file grew between stat() and the
-// hash read, leaving stale entries in the index. Callers skip those.
+// Bytes in chunk `chunk` of a file of `h.size` bytes; the last chunk is
+// short. Returns 0 when the chunk is past EOF, which happens when the
+// file shrank between stat() and now -- callers skip those.
 fn chunk_len(h: &Hashed, chunk: u64, blksz: u64) -> u64 {
     let off = chunk * blksz;
     h.size.saturating_sub(off).min(blksz)
