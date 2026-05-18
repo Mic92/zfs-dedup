@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 
+use crate::bloom::Bloom;
 use crate::cache::{Cache, ChunkHash};
 use crate::clone::{Dedupe, clone_range, dedupe_range};
 use crate::hasher::{Hashed, NOFOLLOW_NONBLOCK, ZERO_HASH};
@@ -90,49 +91,6 @@ fn dup_key(blksz: u32, fsid: u64, h: &ChunkHash) -> u64 {
         ^ fsid.wrapping_mul(0xff51afd7ed558ccd)
 }
 
-// `seen` only needs to answer "have I seen this key before?" and may
-// over-answer: a false positive marks a singleton as a possible dup,
-// which becomes a one-element group that the trailing retain drops.
-// A Bloom filter at 1% FP costs ~1.2 bytes/chunk vs ~16 for a HashSet.
-struct Bloom {
-    bits: Box<[u64]>,
-    mask: u64,
-}
-
-impl Bloom {
-    const K: u32 = 7; // ln(2) * bits/key for 1% FP
-
-    // ~10 bits/key, rounded up to a power of two so position math is a
-    // mask instead of a modulo.
-    fn new(n_keys: u64) -> Self {
-        let bits = (n_keys * 10).next_power_of_two().max(64);
-        Self {
-            bits: vec![0u64; (bits / 64) as usize].into_boxed_slice(),
-            mask: bits - 1,
-        }
-    }
-
-    // Returns whether `k` was already (probably) present, then marks it.
-    // Kirsch-Mitzenmacher double hashing: position_i = h1 + i*h2. With
-    // `mask` a power of two only the low bits matter, so h1 and h2 must
-    // be independent there; split k's halves rather than mixing it,
-    // which keeps the low bits correlated and quintuples the FP rate.
-    fn check_insert(&mut self, k: u64) -> bool {
-        let step = (k >> 32) | 1;
-        // No early exit: every bit must be set even when `present` is
-        // already false.
-        let mut present = true;
-        for i in 0..Self::K {
-            let pos = k.wrapping_add(u64::from(i).wrapping_mul(step)) & self.mask;
-            let word = &mut self.bits[pos as usize / 64];
-            let bit = 1u64 << (pos % 64);
-            present &= *word & bit != 0;
-            *word |= bit;
-        }
-        present
-    }
-}
-
 // Two passes: mark which keys repeat, then collect locations only for
 // those. Building a Vec per chunk and discarding the singletons would
 // transiently allocate several times the final index size on low-dup
@@ -153,6 +111,8 @@ pub fn build_index(files: &[(FilePath, Hashed)], cache: &Cache) -> Result<Index>
         .iter()
         .map(|(_, h)| h.size / u64::from(h.blksz.max(1)) + 1)
         .sum();
+    // `seen` may over-answer: a false positive marks a singleton as a
+    // possible dup -- a one-element group the trailing retain drops.
     let mut seen = Bloom::new(n_chunks);
     let mut dup = Pre::default();
     each_chunk(files, cache, |_, _, blksz, fsid, hash| {
@@ -444,23 +404,6 @@ mod tests {
             let paths: Paths<Hashed> = files.into_iter().collect();
             dedup(&paths, &self.cache, opts).unwrap()
         }
-    }
-
-    #[test]
-    fn bloom_properties() {
-        // Hash sequential ints to scatter bits like real dup_keys.
-        let key =
-            |i: u64| u64::from_le_bytes(hash_chunk(&i.to_le_bytes())[..8].try_into().unwrap());
-        let n = 10_000u64;
-        let mut b = Bloom::new(n);
-        for i in 0..n {
-            b.check_insert(key(i));
-        }
-        // No false negatives.
-        assert!((0..n).all(|i| b.check_insert(key(i))));
-        // FP rate near design target (1%); generous margin for variance.
-        let fp = (n..2 * n).filter(|&i| b.check_insert(key(i))).count();
-        assert!(fp < n as usize / 20, "fp={fp} of {n}");
     }
 
     #[test]
