@@ -82,6 +82,77 @@ impl Hasher for ChunkKeyHasher {
 // the key because zfs_clone_range rejects cross-blocksize clones.
 pub type Index = HashMap<(u32, ChunkHash), Vec<Loc>, BuildHasherDefault<ChunkKeyHasher>>;
 
+// A run of `chunks` consecutive chunks that are duplicates between one
+// source file (starting at `src`) and one destination file (starting
+// at `dst`). Coalescing adjacent chunks turns many small ioctls into
+// one large FICLONERANGE/FIDEDUPERANGE per run.
+#[derive(Clone, Copy)]
+struct Run {
+    src: Loc,
+    dst: Loc,
+    chunks: u32,
+}
+
+// Cap on a coalesced run: bounds the verify buffers and keeps a single
+// ioctl's inode-lock hold time reasonable.
+const MAX_RUN_BYTES: u64 = 16 << 20;
+
+// All runs between one (src file, dst file) pair at one blksz.
+type Pairs = HashMap<(u32, u32, u32), Vec<Run>>;
+
+// Turn hash groups into per-file-pair runs of consecutive chunks.
+// locs[0] of each group is the canonical source (each_chunk emits in
+// (file, chunk) order, so it is stable). Every destination chunk
+// appears in exactly one group, so runs never overlap on the dest.
+fn build_runs(idx: Index, files: &[(FilePath, Hashed)]) -> Pairs {
+    let mut pairs: HashMap<(u32, u32, u32), Vec<(Loc, Loc)>> = HashMap::new();
+    for ((blksz, _), locs) in idx {
+        let src = locs[0];
+        let src_len = chunk_len(&files[src.file as usize].1, src.chunk as u64, blksz as u64);
+        if src_len == 0 {
+            continue; // past stat.size: file grew after stat
+        }
+        for &dst in &locs[1..] {
+            // tail-vs-full mismatch or stale index
+            if chunk_len(&files[dst.file as usize].1, dst.chunk as u64, blksz as u64) != src_len {
+                continue;
+            }
+            pairs
+                .entry((blksz, src.file, dst.file))
+                .or_default()
+                .push((src, dst));
+        }
+    }
+    pairs
+        .into_iter()
+        .map(|(k, locs)| (k, coalesce(locs, k.0 as u64)))
+        .collect()
+}
+
+// Merge (src, dst) chunk pairs whose src and dst chunks are both
+// consecutive into runs, capped at MAX_RUN_BYTES. A short tail chunk
+// is always the last chunk of its file, so it can only end a run.
+fn coalesce(mut locs: Vec<(Loc, Loc)>, blksz: u64) -> Vec<Run> {
+    locs.sort_unstable_by_key(|&(_, dst)| dst.chunk);
+    let mut runs: Vec<Run> = Vec::new();
+    for (src, dst) in locs {
+        if let Some(last) = runs.last_mut()
+            && src.chunk == last.src.chunk + last.chunks
+            && dst.chunk == last.dst.chunk + last.chunks
+            && (last.chunks as u64 + 1) * blksz <= MAX_RUN_BYTES
+        {
+            last.chunks += 1;
+        } else {
+            runs.push(Run {
+                src,
+                dst,
+                chunks: 1,
+            });
+        }
+    }
+    runs
+}
+
 // Truncated index key for the pre-filter set: 8 bytes vs 20. Collisions
 // are safe -- pass 2 re-keys by the full hash, so a colliding singleton
 // becomes a one-Loc group and the trailing retain drops it.
@@ -164,16 +235,17 @@ fn each_chunk(
 }
 
 // Per-rayon-task state for the dedup phase: each task processes one
-// index group at a time, opening files on demand and reusing the two
-// read buffers across groups.
+// (src file, dst file) pair at a time, opening both files once and
+// reusing the two read buffers across runs and pairs.
 //
-// No fd cache: n_workers * n_files would blow `ulimit -n`, and open()
-// is dwarfed by the verify reads.
+// No cross-pair fd cache: n_workers * n_files would blow `ulimit -n`,
+// and open() is dwarfed by the verify reads.
 //
-// Two tasks may open the same file concurrently (different groups, same
+// Two tasks may open the same file concurrently (different pairs, same
 // file). They get independent fds and clone into different offsets;
-// ZFS handles that. Two groups can never touch the same (file, chunk)
-// because a chunk has exactly one hash and so belongs to one group.
+// ZFS handles that. Two pairs can never touch the same (dst file,
+// chunk) because a chunk has exactly one hash and so belongs to one
+// group, which emits it against exactly one source.
 struct Worker<'a> {
     files: &'a Paths<Hashed>,
     opts: Opts,
@@ -217,45 +289,47 @@ impl<'a> Worker<'a> {
             .with_context(|| format!("open {p:?}"))
     }
 
-    fn group(&mut self, blksz: u64, locs: &[Loc]) {
-        // locs[0] is the canonical source: open and read it once,
-        // clone the rest from it.
-        let src = locs[0];
-        let len = chunk_len(self.hashed(src.file as usize), src.chunk as u64, blksz);
-        if len == 0 {
-            return; // past stat.size: file grew after stat
-        }
-        let src_off = src.off(blksz);
-        let compare = self.opts.dry_run || !self.opts.fideduperange;
+    // Bytes covered by a run in file `i`: full chunks plus a possibly
+    // short tail, clipped by stat.size. 0 or a mismatch with the other
+    // side means the index is stale; the caller skips the run.
+    fn run_len(&self, i: usize, first_chunk: u32, chunks: u32, blksz: u64) -> u64 {
+        let h = self.hashed(i);
+        let off = first_chunk as u64 * blksz;
+        h.size.saturating_sub(off).min(chunks as u64 * blksz)
+    }
 
+    // Process all coalesced runs between one source file and one
+    // destination file: open each file once, one ioctl per run.
+    fn pair(&mut self, blksz: u64, src_file: u32, dst_file: u32, runs: &[Run]) {
+        let compare = self.opts.dry_run || !self.opts.fideduperange;
         // Source is read-only: dedup must work on files we can't modify.
-        let prep = |w: &mut Self| -> Result<File> {
-            let sf = w.open(src.file as usize, false)?;
-            if compare {
-                w.buf_a.resize(len as usize, 0);
-                sf.read_exact_at(&mut w.buf_a, src_off)?;
-            }
-            Ok(sf)
-        };
-        let sf = match prep(self) {
-            Ok(f) => f,
+        let opened = self
+            .open(src_file as usize, false)
+            .and_then(|sf| Ok((sf, self.open(dst_file as usize, true)?)));
+        let (sf, df) = match opened {
+            Ok(fds) => fds,
             Err(e) if is_not_found(&e) => return,
             Err(e) => {
                 eprintln!(
-                    "skip group {:?}+{src_off}: {e:#}",
-                    self.path(src.file as usize)
+                    "skip pair {:?} <- {:?}: {e:#}",
+                    self.path(dst_file as usize),
+                    self.path(src_file as usize)
                 );
                 self.stats.errors += 1;
                 return;
             }
         };
 
-        for &dst in &locs[1..] {
-            if len != chunk_len(self.hashed(dst.file as usize), dst.chunk as u64, blksz) {
-                continue; // tail-vs-full mismatch or stale index
+        for run in runs {
+            let len = self.run_len(src_file as usize, run.src.chunk, run.chunks, blksz);
+            if len == 0 || len != self.run_len(dst_file as usize, run.dst.chunk, run.chunks, blksz)
+            {
+                continue; // file shrank since it was hashed
             }
+            let src_off = run.src.off(blksz);
+            let dst_off = run.dst.off(blksz);
             self.stats.candidates += 1;
-            match self.verify_and_clone(&sf, src_off, dst, blksz, len, compare) {
+            match self.verify_and_clone(&sf, src_off, &df, dst_off, len, compare) {
                 Ok(Some(bytes)) => {
                     self.stats.verified += 1;
                     if !self.opts.dry_run {
@@ -268,10 +342,9 @@ impl<'a> Worker<'a> {
                 Err(e) if is_not_found(&e) => {}
                 Err(e) => {
                     eprintln!(
-                        "skip {:?}+{} <- {:?}+{src_off}: {e:#}",
-                        self.path(dst.file as usize),
-                        dst.off(blksz),
-                        self.path(src.file as usize),
+                        "skip {:?}+{dst_off} <- {:?}+{src_off}: {e:#}",
+                        self.path(dst_file as usize),
+                        self.path(src_file as usize),
                     );
                     self.stats.errors += 1;
                 }
@@ -289,31 +362,29 @@ impl<'a> Worker<'a> {
         &mut self,
         sf: &File,
         src_off: u64,
-        dst: Loc,
-        blksz: u64,
+        df: &File,
+        dst_off: u64,
         len: u64,
         compare: bool,
     ) -> Result<Option<u64>> {
-        let dst_off = dst.off(blksz);
-        let df = self.open(dst.file as usize, true)?;
-
         if !compare {
-            return match dedupe_range(sf, src_off, &df, dst_off, len).context("FIDEDUPERANGE")? {
+            return match dedupe_range(sf, src_off, df, dst_off, len).context("FIDEDUPERANGE")? {
                 Dedupe::Same(b) => Ok(Some(b)),
                 Dedupe::Differs => Ok(None),
                 Dedupe::Unsupported => anyhow::bail!("FIDEDUPERANGE unsupported"),
             };
         }
 
-        // Source chunk is in buf_a from group(). Racy against concurrent
-        // writers, hence --force.
+        // Racy against concurrent writers, hence --force.
+        self.buf_a.resize(len as usize, 0);
+        sf.read_exact_at(&mut self.buf_a, src_off)?;
         self.buf_b.resize(len as usize, 0);
         df.read_exact_at(&mut self.buf_b, dst_off)?;
         if self.buf_a != self.buf_b {
             return Ok(None);
         }
         if !self.opts.dry_run {
-            clone_range(sf, src_off, &df, dst_off, len).context("FICLONERANGE")?;
+            clone_range(sf, src_off, df, dst_off, len).context("FICLONERANGE")?;
         }
         Ok(Some(len))
     }
@@ -323,12 +394,13 @@ impl<'a> Worker<'a> {
 // from a single ZFS dataset: the VFS rejects cross-superblock
 // FIDEDUPERANGE with EXDEV, and the index does not partition by fsid.
 pub fn dedup(files: &Paths<Hashed>, cache: &Cache, opts: Opts) -> Result<Stats> {
-    Ok(build_index(&files.files, cache)?
+    let idx = build_index(&files.files, cache)?;
+    Ok(build_runs(idx, &files.files)
         .into_par_iter()
         .fold(
             || Worker::new(files, opts),
-            |mut w, ((blksz, _), locs)| {
-                w.group(blksz as u64, &locs);
+            |mut w, ((blksz, src_file, dst_file), runs)| {
+                w.pair(blksz as u64, src_file, dst_file, &runs);
                 w
             },
         )
