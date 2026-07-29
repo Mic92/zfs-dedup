@@ -28,12 +28,16 @@ pub fn enter_private_mount_ns() -> Result<()> {
     Ok(())
 }
 
-struct Mount {
-    point: PathBuf,
+pub(crate) struct Mount {
+    pub(crate) point: PathBuf,
+    // Path within the source filesystem; "/" for a dataset root,
+    // something else for a bind mount of a subtree.
+    pub(crate) root: PathBuf,
+    pub(crate) source: String,
     flags: MountFlags,
     ro: bool,
     super_rw: bool,
-    fstype: String,
+    pub(crate) fstype: String,
 }
 
 // mountinfo escapes space/tab/newline/backslash as \040 etc.
@@ -54,16 +58,20 @@ fn unescape(s: &str) -> PathBuf {
 
 // /proc/self/mountinfo line:
 //   id parent maj:min root mountpoint opts [optional...] - fstype src superopts
-fn parse_mountinfo(line: &str) -> Option<Mount> {
+pub(crate) fn parse_mountinfo(line: &str) -> Option<Mount> {
     let (head, tail) = line.split_once(" - ")?;
     let mut h = head.split(' ');
-    let point = unescape(h.nth(4)?);
+    let root = unescape(h.nth(3)?);
+    let point = unescape(h.next()?);
     let opts = h.next()?;
     let mut t = tail.split(' ');
     let fstype = t.next()?.to_owned();
-    let super_opts = t.nth(1)?;
+    let source = t.next()?.to_owned();
+    let super_opts = t.next()?;
     Some(Mount {
         point,
+        root,
+        source,
         flags: opts.split(',').filter_map(opt_flag).collect(),
         ro: opts.split(',').any(|o| o == "ro"),
         super_rw: super_opts.split(',').any(|o| o == "rw"),
@@ -123,6 +131,8 @@ mod tests {
         let l = "54 39 0:33 /nix/store /nix/store ro,nosuid,nodev,relatime shared:17 - zfs zroot/root/nixos rw,xattr,posixacl,casesensitive";
         let m = parse_mountinfo(l).unwrap();
         assert_eq!(m.point, Path::new("/nix/store"));
+        assert_eq!(m.root, Path::new("/nix/store"));
+        assert_eq!(m.source, "zroot/root/nixos");
         assert!(m.ro);
         assert!(m.super_rw);
         assert_eq!(m.fstype, "zfs");

@@ -152,22 +152,27 @@ fn cloneable_pools() -> Result<HashSet<String>> {
 }
 
 // Mountpoints of every mounted ZFS dataset on a block_cloning pool.
+// Read from mountinfo, not the `mountpoint` property, so legacy mounts
+// (fstab roots, docker's zfs graph driver) are found too. Subtree bind
+// mounts (root != "/") are skipped; the dataset root already covers them.
 pub fn zfs_mounts() -> Result<Vec<PathBuf>> {
     let pools = cloneable_pools()?;
-    let out = zfs_cmd(
-        "zfs",
-        &["list", "-H", "-t", "filesystem", "-o", "name,mountpoint"],
-    )?;
-    Ok(out
+    let mountinfo =
+        std::fs::read_to_string("/proc/self/mountinfo").context("read /proc/self/mountinfo")?;
+    Ok(zfs_mountpoints(&mountinfo, &pools))
+}
+
+fn zfs_mountpoints(mountinfo: &str, pools: &HashSet<String>) -> Vec<PathBuf> {
+    mountinfo
         .lines()
-        .filter_map(|l| l.split_once('\t'))
-        .filter(|(ds, mp)| {
-            mp.starts_with('/') && pools.contains(ds.split('/').next().unwrap_or(ds))
+        .filter_map(crate::remount::parse_mountinfo)
+        .filter(|m| {
+            m.fstype == "zfs"
+                && m.root == Path::new("/")
+                && pools.contains(m.source.split('/').next().unwrap_or(&m.source))
         })
-        .map(|(_, mp)| PathBuf::from(mp))
-        // Datasets can have a mountpoint set but not be mounted.
-        .filter(|p| is_zfs(p))
-        .collect())
+        .map(|m| m.point)
+        .collect()
 }
 
 // Per-dataset filesystem id from statvfs. ZFS derives this from the
@@ -292,6 +297,27 @@ fn walk_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mounts_include_legacy_and_skip_binds_and_foreign() {
+        let mountinfo = "\
+39 1 0:33 / / rw,noatime shared:1 - zfs zroot/root/nixos rw,xattr,posixacl
+54 39 0:33 /nix/store /nix/store ro,nosuid,nodev shared:17 - zfs zroot/root/nixos rw,xattr
+60 39 0:40 / /var/lib/docker/zfs/graph/abc rw,relatime - zfs zroot/docker/abc rw,xattr
+61 39 0:41 / /zroot rw,noatime - zfs zroot rw,xattr
+62 39 0:50 / /old ro,relatime - zfs oldpool/data ro,xattr
+63 39 259:1 / /boot rw,relatime - vfat /dev/nvme0n1p1 rw";
+        let pools: HashSet<String> = ["zroot".to_owned()].into();
+        let got = zfs_mountpoints(mountinfo, &pools);
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("/"),
+                PathBuf::from("/var/lib/docker/zfs/graph/abc"),
+                PathBuf::from("/zroot"),
+            ]
+        );
+    }
 
     #[test]
     fn filtering() {
