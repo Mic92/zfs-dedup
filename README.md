@@ -31,8 +31,8 @@ or `cargo build --release`.
 - OpenZFS **2.3.0+** recommended: hash reads use `O_DIRECT` to avoid
   evicting your hot ARC during a cold scan. Older ZFS silently falls
   back to buffered reads.
-- `FIDEDUPERANGE` for in-kernel verify+clone needs a patched ZFS;
-  stock ZFS requires `--force` for the userspace verify path.
+- `FIDEDUPERANGE` for in-kernel verify+clone needs a patched ZFS.
+  Stock ZFS requires `--force` for the userspace verify path.
   Currently proposed upstream in <https://github.com/openzfs/zfs/pull/18745>.
 - Read-only ZFS bind mounts over a writable dataset (e.g.,
   `/nix/store` on NixOS) are remounted read-write in a private mount
@@ -74,7 +74,7 @@ window. Only use `--force` when you are sure that no process will modify your da
 while `zfs-dedup` runs.
 
 FIDEDUPERANGE support is proposed upstream in
-<https://github.com/openzfs/zfs/pull/18745>; zfs-dedup uses it
+<https://github.com/openzfs/zfs/pull/18745>. zfs-dedup uses it
 automatically when available.
 
 ## Memory
