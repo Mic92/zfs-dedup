@@ -254,7 +254,7 @@ fn walk_root(
                     // Prune at mount boundaries; child datasets get
                     // their own walk_root call from main.
                     if m.dev() != root_dev {
-                        c.read_children_path = None;
+                        c.read_children = None;
                     }
                 } else {
                     c.client_state = Some((m.dev(), m.ino(), m.nlink()));
