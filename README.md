@@ -33,7 +33,7 @@ or `cargo build --release`.
   back to buffered reads.
 - `FIDEDUPERANGE` for in-kernel verify+clone needs a patched ZFS;
   stock ZFS requires `--force` for the userspace verify path.
-  Currently a patch living in this branch: https://github.com/Mic92/zfs/tree/fideduperange
+  Currently proposed upstream in <https://github.com/openzfs/zfs/pull/18745>.
 - Read-only ZFS bind mounts over a writable dataset (e.g.,
   `/nix/store` on NixOS) are remounted read-write in a private mount
   namespace; the host's mounts are not modified.
@@ -73,8 +73,9 @@ zfs-dedup refuses unless you pass `--force` to accept the small race
 window. Only use `--force` when you are sure that no process will modify your data,
 while `zfs-dedup` runs.
 
-The patch for ioctl currently lives in this branch: <https://github.com/Mic92/zfs/tree/fideduperange>.
-It adds FIDEDUPERANGE support, which zfs-dedup uses automatically when available.
+FIDEDUPERANGE support is proposed upstream in
+<https://github.com/openzfs/zfs/pull/18745>; zfs-dedup uses it
+automatically when available.
 
 ## Memory
 
