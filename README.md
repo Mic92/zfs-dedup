@@ -36,7 +36,7 @@ or `cargo build --release`.
   Currently proposed upstream in <https://github.com/openzfs/zfs/pull/18745>.
 - Read-only ZFS bind mounts over a writable dataset (e.g.,
   `/nix/store` on NixOS) are remounted read-write in a private mount
-  namespace; the host's mounts are not modified.
+  namespace. The host's mounts are not modified.
 
 ## Usage
 
