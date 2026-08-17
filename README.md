@@ -79,16 +79,15 @@ automatically when available.
 
 ## Memory
 
-zfs-dedup needs roughly 250 MiB per million files in the largest dataset.
-As datasets are scanned one at a time, only the biggest one that matters.
+zfs-dedup needs roughly 240 MiB per million files in the largest dataset
+during the walk, dropping to about 65 MiB per million afterwards.
+As datasets are scanned one at a time, only the biggest one matters.
 
-| files in largest dataset | peak RSS |
-|---|---|
-| 1 M | ~350 MiB |
-| 10 M | ~2.5 GiB |
-| 50 M | ~12.5 GiB |
-
-The peak is brief, during the walk. The dedup phase that follows runs at about a third of that.
+| files in largest dataset | peak RSS | after the walk |
+|---|---|---|
+| 1 M | ~240 MiB | ~65 MiB |
+| 10 M | ~2.4 GiB | ~650 MiB |
+| 50 M | ~12 GiB | ~3.2 GiB |
 
 ## Limitations
 
