@@ -1,55 +1,112 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::mpsc::sync_channel;
 
 use anyhow::{Context, Result, bail};
 use rustix::fs::{FsWord, statfs, statvfs};
 
-// File paths split at the last component. Parents are Arc-shared with
-// siblings (jwalk already keeps it that way) and filenames live in one
-// flat byte arena: no per-file heap allocation, no fat-pointer slop.
-// On a 30M-file scan this cuts the path list -- the largest fixed cost
-// in RAM -- by more than half.
+// File paths prefix-compressed into a directory table. Every directory
+// is (parent id, basename) and every file is (dir id, basename). All
+// basenames live in one flat byte arena, so each path component is
+// stored once rather than once per file.
 pub struct Paths<T> {
-    arena: Vec<u8>,
+    pub table: PathTable,
     pub files: Vec<(FilePath, T)>,
 }
 
-// 24 bytes; was 32 plus a heap allocation per file.
+// `ids` is only needed for interning during the walk. seal() drops it.
+#[derive(Default)]
+pub struct PathTable {
+    arena: Vec<u8>,
+    dirs: Vec<Dir>,
+    ids: HashMap<PathBuf, u32>,
+}
+
+struct Dir {
+    parent: u32, // NO_PARENT for a root component
+    off: u32,
+    len: u32,
+}
+
+const NO_PARENT: u32 = u32::MAX;
+
+impl PathTable {
+    fn add_name(&mut self, name: &[u8]) -> (u32, u32) {
+        let off = u32::try_from(self.arena.len()).expect("path arena overflow");
+        self.arena.extend_from_slice(name);
+        (off, name.len() as u32)
+    }
+
+    fn name(&self, off: u32, len: u32) -> &OsStr {
+        OsStr::from_bytes(&self.arena[off as usize..(off + len) as usize])
+    }
+
+    fn intern(&mut self, p: &Path) -> u32 {
+        if let Some(&id) = self.ids.get(p) {
+            return id;
+        }
+        // "/" or "" become a root entry holding the whole path.
+        let (parent, name) = match (p.parent(), p.file_name()) {
+            (Some(par), Some(name)) => (self.intern(par), name),
+            _ => (NO_PARENT, p.as_os_str()),
+        };
+        let (off, len) = self.add_name(name.as_bytes());
+        let id = u32::try_from(self.dirs.len()).expect("dir table overflow");
+        assert!(id != NO_PARENT, "dir table overflow");
+        self.dirs.push(Dir { parent, off, len });
+        self.ids.insert(p.to_path_buf(), id);
+        id
+    }
+
+    fn dir_path(&self, mut id: u32) -> PathBuf {
+        let mut parts = Vec::new();
+        while id != NO_PARENT {
+            let d = &self.dirs[id as usize];
+            parts.push((d.off, d.len));
+            id = d.parent;
+        }
+        let mut p = PathBuf::new();
+        for &(off, len) in parts.iter().rev() {
+            p.push(self.name(off, len));
+        }
+        p
+    }
+
+    fn seal(&mut self) {
+        self.ids = HashMap::new();
+    }
+}
+
+// 12 bytes.
 pub struct FilePath {
-    parent: Arc<Path>,
+    dir: u32,
     off: u32,
     len: u32,
 }
 
 impl FilePath {
-    pub fn to_path(&self, arena: &[u8]) -> PathBuf {
-        let name = &arena[self.off as usize..(self.off + self.len) as usize];
-        self.parent.join(Path::new(OsStr::from_bytes(name)))
+    pub fn to_path(&self, table: &PathTable) -> PathBuf {
+        table
+            .dir_path(self.dir)
+            .join(table.name(self.off, self.len))
     }
 }
 
 impl<T> Paths<T> {
     pub fn path(&self, fp: &FilePath) -> PathBuf {
-        fp.to_path(&self.arena)
+        fp.to_path(&self.table)
     }
 
-    fn push(&mut self, parent: Arc<Path>, name: &OsStr, payload: T) {
-        let off = u32::try_from(self.arena.len()).expect("path arena overflow");
-        self.arena.extend_from_slice(name.as_bytes());
-        self.files.push((
-            FilePath {
-                parent,
-                off,
-                len: name.len() as u32,
-            },
-            payload,
-        ));
+    fn push(&mut self, parent: &Path, name: &OsStr, payload: T) {
+        let dir = self.table.intern(parent);
+        let (off, len) = self.table.add_name(name.as_bytes());
+        self.files.push((FilePath { dir, off, len }, payload));
     }
 
     // Re-tag the payloads in batches, sharing the same arena. The step
@@ -58,9 +115,9 @@ impl<T> Paths<T> {
     pub fn map_batched<U>(
         self,
         batch: usize,
-        mut step: impl FnMut(&[u8], Vec<(FilePath, T)>) -> Result<Vec<(FilePath, U)>>,
+        mut step: impl FnMut(&PathTable, Vec<(FilePath, T)>) -> Result<Vec<(FilePath, U)>>,
     ) -> Result<Paths<U>> {
-        let Self { arena, files } = self;
+        let Self { table, files } = self;
         let mut out = Vec::with_capacity(files.len());
         let mut iter = files.into_iter();
         loop {
@@ -68,27 +125,30 @@ impl<T> Paths<T> {
             if chunk.is_empty() {
                 break;
             }
-            out.extend(step(&arena, chunk)?);
+            out.extend(step(&table, chunk)?);
         }
-        Ok(Paths { arena, files: out })
+        Ok(Paths { table, files: out })
     }
 
     // Drop payloads the closure rejects; the arena keeps unused names
     // (cheaper than compacting and harmless).
-    pub fn filter_map<U>(self, mut f: impl FnMut(&FilePath, T, &[u8]) -> Option<U>) -> Paths<U> {
-        let Self { arena, files } = self;
+    pub fn filter_map<U>(
+        self,
+        mut f: impl FnMut(&FilePath, T, &PathTable) -> Option<U>,
+    ) -> Paths<U> {
+        let Self { table, files } = self;
         let files = files
             .into_iter()
-            .filter_map(|(p, t)| f(&p, t, &arena).map(|u| (p, u)))
+            .filter_map(|(p, t)| f(&p, t, &table).map(|u| (p, u)))
             .collect();
-        Paths { arena, files }
+        Paths { table, files }
     }
 }
 
 impl<T> Default for Paths<T> {
     fn default() -> Self {
         Self {
-            arena: Vec::new(),
+            table: PathTable::default(),
             files: Vec::new(),
         }
     }
@@ -100,11 +160,12 @@ impl<T> FromIterator<(PathBuf, T)> for Paths<T> {
         let mut out = Self::default();
         for (p, t) in iter {
             out.push(
-                Arc::from(p.parent().unwrap_or(Path::new(""))),
+                p.parent().unwrap_or(Path::new("")),
                 p.file_name().unwrap_or(OsStr::new("")),
                 t,
             );
         }
+        out.table.seal();
         out
     }
 }
@@ -203,16 +264,77 @@ pub fn files<'a>(
         };
         walk_root(root, dev, fsid, exclude, &mut seen, &mut out);
     }
-    // Both grew without a size hint; doubling leaves ~33% slack. The
+    // All grew without a size hint; doubling leaves ~33% slack. The
     // realloc here returns it before hashing inflates RSS further.
+    out.table.seal();
     out.files.shrink_to_fit();
-    out.arena.shrink_to_fit();
+    out.table.arena.shrink_to_fit();
+    out.table.dirs.shrink_to_fit();
     out
 }
 
-// (dev, ino, nlink) carried out of the parallel jwalk callback so the
-// serial consumer doesn't re-stat every file.
-type FileMeta = Option<(u64, u64, u64)>;
+// One directory's stat'ed files: (name, dev, ino, nlink) each.
+type DirBatch = (PathBuf, Vec<(OsString, u64, u64, u64)>);
+
+fn walk_dir<'a>(
+    sc: &rayon::Scope<'a>,
+    dir: PathBuf,
+    root_dev: u64,
+    tx: &'a std::sync::mpsc::SyncSender<DirBatch>,
+) {
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("walk: {}: {e}", dir.display());
+            return;
+        }
+    };
+    let mut batch = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("walk: {}: {e}", dir.display());
+                continue;
+            }
+        };
+        // Does not follow symlinks.
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) => {
+                // Vanished mid-walk. Not an error.
+                if e.kind() != ErrorKind::NotFound {
+                    eprintln!("walk: {}: {e}", entry.path().display());
+                }
+                continue;
+            }
+        };
+        if !ft.is_dir() && !ft.is_file() {
+            continue;
+        }
+        let m = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                if e.kind() != ErrorKind::NotFound {
+                    eprintln!("walk: {}: {e}", entry.path().display());
+                }
+                continue;
+            }
+        };
+        if ft.is_dir() {
+            // Prune at mount boundaries. Child datasets get their own
+            // walk_root call from main.
+            if m.dev() == root_dev {
+                sc.spawn(move |sc| walk_dir(sc, entry.path(), root_dev, tx));
+            }
+        } else {
+            batch.push((entry.file_name(), m.dev(), m.ino(), m.nlink()));
+        }
+    }
+    if !batch.is_empty() {
+        let _ = tx.send((dir, batch));
+    }
+}
 
 fn walk_root(
     root: &Path,
@@ -222,76 +344,32 @@ fn walk_root(
     seen: &mut HashSet<(u64, u64)>,
     out: &mut Paths<u64>,
 ) {
-    // process_read_dir runs on rayon threads: stat there so the per-file
-    // syscall is parallel. The for loop below is single-threaded and
-    // must only touch what the callback already collected.
-    for entry in jwalk::WalkDirGeneric::<((), FileMeta)>::new(root)
-        .skip_hidden(false)
-        .follow_links(false)
-        .sort(false)
-        .process_read_dir(move |_, _, _, children| {
-            for c in children.iter_mut().flatten() {
-                let ft = c.file_type();
-                if !ft.is_dir() && !ft.is_file() {
+    // Directories are read and files stat'ed in parallel on rayon
+    // workers, which stream compact batches through a bounded channel
+    // to the serial consumer below. A full channel blocks the workers,
+    // so peak memory stays at O(workers * dir size + channel capacity)
+    // no matter how far the walk runs ahead.
+    let (tx, rx) = sync_channel::<DirBatch>(1024);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            rayon::scope(|sc| walk_dir(sc, root.to_path_buf(), root_dev, &tx));
+            drop(tx); // ends the rx loop
+        });
+        for (parent, files) in rx {
+            for (name, dev, ino, nlink) in files {
+                // A different dev means we crossed a mount point.
+                if dev != root_dev || exclude.contains(&(dev, ino)) {
                     continue;
                 }
-                let m = match c.metadata() {
-                    Ok(m) => m,
-                    // Files vanish mid-walk; not an error. On other
-                    // errors leave client_state None: the consumer skips
-                    // the file, but a dir is still descended -- pruning
-                    // silently would drop the subtree.
-                    Err(e) => {
-                        if e.io_error()
-                            .is_none_or(|io| io.kind() != ErrorKind::NotFound)
-                        {
-                            eprintln!("walk: {}: {e}", c.path().display());
-                        }
-                        continue;
-                    }
-                };
-                if ft.is_dir() {
-                    // Prune at mount boundaries; child datasets get
-                    // their own walk_root call from main.
-                    if m.dev() != root_dev {
-                        c.read_children = None;
-                    }
-                } else {
-                    c.client_state = Some((m.dev(), m.ino(), m.nlink()));
+                // `seen` collapses hardlinks. Files with nlink == 1
+                // have no aliases and skip the HashSet.
+                if nlink > 1 && !seen.insert((dev, ino)) {
+                    continue;
                 }
+                out.push(&parent, &name, fsid);
             }
-        })
-    {
-        let entry = match entry {
-            Ok(e) => e,
-            // Files vanish during a live walk all the time; not an error.
-            Err(e)
-                if e.io_error()
-                    .is_some_and(|io| io.kind() == ErrorKind::NotFound) =>
-            {
-                continue;
-            }
-            Err(e) => {
-                eprintln!("walk: {e}");
-                continue;
-            }
-        };
-        let Some((dev, ino, nlink)) = entry.client_state else {
-            continue;
-        };
-        // Stay on the root filesystem; a different dev means we crossed
-        // a mount point, which could be non-ZFS or a different pool.
-        if dev != root_dev || exclude.contains(&(dev, ino)) {
-            continue;
         }
-        // `seen` exists to dedup hardlinks. Files with nlink == 1 have
-        // no aliases, so don't pay HashSet memory for them; that's most
-        // of any tree.
-        if nlink > 1 && !seen.insert((dev, ino)) {
-            continue;
-        }
-        out.push(entry.parent_path.clone(), &entry.file_name, fsid);
-    }
+    });
 }
 
 #[cfg(test)]
