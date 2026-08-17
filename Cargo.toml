@@ -17,6 +17,7 @@ mimalloc = "0.1.52"
 
 [dev-dependencies]
 divan = "0.1"
+libc = "0.2.189"
 
 [[bench]]
 name = "throughput"
