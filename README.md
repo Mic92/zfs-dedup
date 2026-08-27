@@ -31,9 +31,9 @@ or `cargo build --release`.
 - OpenZFS **2.3.0+** recommended: hash reads use `O_DIRECT` to avoid
   evicting your hot ARC during a cold scan. Older ZFS silently falls
   back to buffered reads.
-- `FIDEDUPERANGE` for in-kernel verify+clone needs a patched ZFS.
-  Stock ZFS requires `--force` for the userspace verify path.
-  Currently proposed upstream in <https://github.com/openzfs/zfs/pull/18745>.
+- `FIDEDUPERANGE` for in-kernel verify+clone is in OpenZFS master
+  (<https://github.com/openzfs/zfs/pull/18745>, not yet in a release).
+  Older ZFS requires `--force` for the userspace verify path.
 - Read-only ZFS bind mounts over a writable dataset (e.g.,
   `/nix/store` on NixOS) are remounted read-write in a private mount
   namespace. The host's mounts are not modified.
@@ -67,15 +67,17 @@ get rehashed.
 ## Why it asks for --force
 
 Deduping safely needs to compare two ranges and clone them in one
-operation, otherwise something could write to one of them in between.
-Stock OpenZFS doesn't have this ioctl yet, so by default
-zfs-dedup refuses unless you pass `--force` to accept the small race
-window. Only use `--force` when you are sure that no process will modify your data,
-while `zfs-dedup` runs.
+operation (`FIDEDUPERANGE`), otherwise something could write to one of
+them in between. OpenZFS gained this ioctl in
+<https://github.com/openzfs/zfs/pull/18745> (master, not yet released).
+zfs-dedup uses it automatically when available.
 
-FIDEDUPERANGE support is proposed upstream in
-<https://github.com/openzfs/zfs/pull/18745>. zfs-dedup uses it
-automatically when available.
+On older ZFS, zfs-dedup falls back to a userspace compare followed by
+`FICLONERANGE` and refuses unless you pass `--force` to accept the small
+race window. Only use `--force` when you are sure that no process will
+modify your data while `zfs-dedup` runs. The fallback also bumps the
+mtime of deduped files, because ZFS treats a clone as a write.
+`FIDEDUPERANGE` leaves timestamps untouched.
 
 ## Memory
 
