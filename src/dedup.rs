@@ -20,6 +20,8 @@ pub struct Stats {
     pub cloned: usize,
     pub bytes: u64,
     pub mismatches: usize,
+    // Files in use (leased, executing, immutable). Retried next run.
+    pub busy: usize,
     pub errors: usize,
 }
 
@@ -30,6 +32,7 @@ impl std::ops::AddAssign for Stats {
         self.cloned += o.cloned;
         self.bytes += o.bytes;
         self.mismatches += o.mismatches;
+        self.busy += o.busy;
         self.errors += o.errors;
     }
 }
@@ -309,6 +312,10 @@ impl<'a> Worker<'a> {
         let (sf, df) = match opened {
             Ok(fds) => fds,
             Err(e) if is_not_found(&e) => return,
+            Err(e) if is_busy(&e) => {
+                self.stats.busy += 1;
+                return;
+            }
             Err(e) => {
                 eprintln!(
                     "skip pair {:?} <- {:?}: {e:#}",
@@ -340,6 +347,7 @@ impl<'a> Worker<'a> {
                 Ok(None) => self.stats.mismatches += 1,
                 // File vanished or shrank since we hashed it.
                 Err(e) if is_not_found(&e) => {}
+                Err(e) if is_busy(&e) => self.stats.busy += 1,
                 Err(e) => {
                     eprintln!(
                         "skip {:?}+{dst_off} <- {:?}+{src_off}: {e:#}",
@@ -423,6 +431,21 @@ pub fn is_not_found(e: &anyhow::Error) -> bool {
     })
 }
 
+// The file exists but can't be touched right now on a live system:
+// EAGAIN   - O_NONBLOCK open would have to break an NFS delegation/lease
+// ETXTBSY  - opening a running executable for write
+// EPERM    - immutable/append-only inode (EACCES stays a real error)
+// None of these indicate a problem with the tool or the pool, so they
+// must not fail the run. The file is simply picked up next time.
+pub fn is_busy(e: &anyhow::Error) -> bool {
+    use rustix::io::Errno;
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .and_then(Errno::from_io_error)
+            .is_some_and(|errno| matches!(errno, Errno::AGAIN | Errno::TXTBSY | Errno::PERM))
+    })
+}
+
 // Bytes in chunk `chunk` of a file of `h.size` bytes; the last chunk is
 // short. Returns 0 if the chunk's offset is at or past EOF: defensive
 // against a stale index entry, which callers skip.
@@ -500,6 +523,20 @@ mod tests {
         assert!(is_not_found(&wrapped));
         let other = anyhow::anyhow!("unrelated");
         assert!(!is_not_found(&other));
+    }
+
+    #[test]
+    fn busy_errors_are_benign() {
+        for errno in [libc::EAGAIN, libc::ETXTBSY, libc::EPERM] {
+            let io = std::io::Error::from_raw_os_error(errno);
+            let wrapped = anyhow::Error::from(io).context("open foo");
+            assert!(is_busy(&wrapped), "errno {errno}");
+            assert!(!is_not_found(&wrapped), "errno {errno}");
+        }
+        let eacces = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EACCES));
+        assert!(!is_busy(&eacces));
+        let eio = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EIO));
+        assert!(!is_busy(&eio));
     }
 
     #[test]

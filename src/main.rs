@@ -254,6 +254,10 @@ proceed."
             }
             // Files vanish mid-scan on a live system; not an error.
             Err(e) if dedup::is_not_found(&e) => None,
+            Err(e) if dedup::is_busy(&e) => {
+                stats.busy += 1;
+                None
+            }
             Err(e) => {
                 eprintln!("skip {}: {e:#}", p.to_path(arena).display());
                 hash_errors += 1;
@@ -292,11 +296,12 @@ proceed."
     };
     let verb = if args.dry_run { "would save" } else { "saved" };
     eprintln!(
-        "{verb} {} ({pct:.1}%) across {} blocks, {} mismatches, {} errors",
+        "{verb} {} ({pct:.1}%) across {} blocks, {} mismatches, {} busy files skipped, {} errors",
         human(stats.bytes),
         stats.verified,
         stats.mismatches,
-        stats.errors,
+        stats.busy,
+        hash_errors + stats.errors,
     );
     Ok(hash_errors == 0 && stats.errors == 0)
 }
