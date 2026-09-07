@@ -79,6 +79,27 @@ modify your data while `zfs-dedup` runs. The fallback also bumps the
 mtime of deduped files, because ZFS treats a clone as a write.
 `FIDEDUPERANGE` leaves timestamps untouched.
 
+## Existing pools
+
+`FIDEDUPERANGE` is only a new ioctl in the kernel module. It adds no
+pool feature flag and does not change the on-disk format. It uses the
+same `block_cloning` feature `FICLONERANGE` has used since 2.2. For a
+pool created before that:
+
+- Enable `feature@block_cloning` (`zpool upgrade` or
+  `zpool set feature@block_cloning=enabled <pool>`). Pools without it
+  are skipped.
+- On 2.2.1 through 2.2.x set the `zfs_bclone_enabled=1` module
+  parameter. It defaults to on since 2.3.0.
+- Blocks written before the feature was enabled clone fine, no rewrite
+  needed.
+- Encrypted datasets can only clone into each other when they share
+  the same master key, i.e. the same encryption root.
+
+Once your ZFS includes openzfs/zfs#18745, zfs-dedup detects
+`FIDEDUPERANGE` automatically and `--force` is no longer needed. The
+hash cache from earlier runs stays valid.
+
 ## Memory
 
 zfs-dedup needs roughly 240 MiB per million files in the largest dataset
